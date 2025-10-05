@@ -20,6 +20,18 @@ const REDIRECT_URI = process.env.REDIRECT_URI; // REQUIRED, e.g., https://your-a
 
 const PORT = process.env.PORT || 3000; 
 
+// --- CRITICAL ENV VAR CHECK ---
+if (!TOKEN || !CLIENT_ID || !DISCORD_CLIENT_SECRET || !REDIRECT_URI) {
+    console.error("FATAL ERROR: One or more critical environment variables (TOKEN, CLIENT_ID, DISCORD_CLIENT_SECRET, REDIRECT_URI) are missing. Please configure them in your hosting environment.");
+    if (!REDIRECT_URI) {
+        console.error("REDIRECT_URI is missing. This is often the cause of the 'Invalid redirect_uri' error.");
+    }
+} else {
+    // This will print the exact URI the app is using, helping to confirm configuration.
+    console.log(`OAuth configured. Expected Redirect URI: ${REDIRECT_URI}`);
+}
+// ------------------------------
+
 const client = new Client({ 
     intents: [
         GatewayIntentBits.Guilds,
