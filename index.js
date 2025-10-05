@@ -24,7 +24,7 @@ const PUBLIC_URL = process.env.PUBLIC_URL || RENDER_HOST_URL || `http://localhos
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
 // The REDIRECT_URI is now constructed using the PUBLIC_URL
 const REDIRECT_URI = `${PUBLIC_URL}/discord/callback`; 
-const SCOPES = 'identify guilds';
+const SCOPES = 'identify guilds'; // We need 'guilds' to see which servers the user is in
 const BOT_PERMISSIONS = '8'; // Administrator
 
 const client = new Client({ 
@@ -85,8 +85,7 @@ function generatePairings(players) {
 
 /**
  * Draws the tournament bracket using the canvas library.
- * @param {Array<{p1: string, p2: string, matchId: number, winner: string | null}>} pairings - The current round's matches.
- * @returns {Promise<Buffer>} - A promise that resolves to a PNG image buffer.
+ * [Bracket drawing logic remains unchanged]
  */
 async function drawTournamentBracket(pairings) {
     const WIDTH = 800;
@@ -161,6 +160,7 @@ async function drawTournamentBracket(pairings) {
 
 /**
  * Updates the Discord message with the latest participants and bracket image.
+ * [Update post logic remains unchanged]
  */
 async function updateTournamentPost() {
     if (!tournamentState.messageId || !tournamentState.channelId) return;
@@ -204,12 +204,28 @@ async function updateTournamentPost() {
 }
 
 /**
- * Generates the HTML form with dynamic server and channel selection logic.
- * @param {string} loginContent - Content to display instead of the form (e.g., login button or guild list).
+ * Generates the HTML based on whether the user is logged in (has filtered guilds) or not.
+ * @param {Array<Object> | null} filteredGuilds - List of guilds the user is in AND the bot is in.
  * @returns {string} The full HTML content.
  */
-function getWebpageHtml(loginContent = 'login') {
-    const defaultForm = `
+function getWebpageHtml(filteredGuilds = null) {
+    // --- 1. Generate the dropdown options based on the provided, filtered list ---
+    let guildOptions = '<option value="" disabled selected>Select a Server</option>';
+    let formDisabled = 'disabled';
+    
+    if (filteredGuilds && filteredGuilds.length > 0) {
+        formDisabled = '';
+        const sortedGuilds = filteredGuilds.sort((a, b) => a.name.localeCompare(b.name));
+        guildOptions = sortedGuilds.map(guild => 
+            `<option value="${guild.id}">${guild.name}</option>`
+        ).join('');
+    } else if (filteredGuilds) {
+        // Logged in, but bot is not in any of the user's servers
+        guildOptions = '<option value="" disabled selected>Bot not in any of your servers</option>';
+    }
+
+    // --- 2. The main form content ---
+    const setupForm = `
         <p>Define the parameters to launch the tournament registration on Discord.</p>
         <form action="/start-tournament" method="POST">
             <label for="name">Tournament Name</label>
@@ -222,8 +238,8 @@ function getWebpageHtml(loginContent = 'login') {
             <input type="text" id="entryFee" name="entryFee" placeholder="e.g., Free, 5,000 Gold, or None">
 
             <label for="guildId">Target Discord Server</label>
-            <select id="guildId" name="guildId" required>
-                <option value="" disabled selected>Loading Servers...</option>
+            <select id="guildId" name="guildId" required ${formDisabled}>
+                ${guildOptions}
             </select>
             
             <label for="channelId">Target Discord Channel</label>
@@ -231,23 +247,23 @@ function getWebpageHtml(loginContent = 'login') {
                 <option value="" disabled selected>Select a Server First</option>
             </select>
             
-            <button type="submit">🚀 Launch Registration Event</button>
+            <button type="submit" ${formDisabled ? 'disabled' : ''}>🚀 Launch Registration Event</button>
         </form>
+        <hr style="border-top: 1px solid var(--border-color); margin: 30px 0;">
+        <p style="margin-bottom: 0;">Is your server missing? <a href="/discord/invite" style="color: var(--success-color); font-weight: 600;">Invite the bot here</a>.</p>
     `;
 
-    const loginButton = `
-        <p>Login with Discord to invite the bot to a new server:</p>
+    // --- 3. The login content if not logged in ---
+    const loginPrompt = `
+        <p>You must log in with Discord to manage tournaments and see only your servers.</p>
         <a href="/discord/login" style="text-decoration: none;">
             <button type="button" style="background-color: #5865F2; /* Discord Blurple */">
-                🔗 Login with Discord to Invite Bot
+                🔗 Login with Discord
             </button>
         </a>
-        <hr style="border-top: 1px solid var(--border-color); margin: 30px 0;">
-        <p>Or start a tournament in a server where the bot is already added:</p>
-        ${defaultForm}
     `;
-
-    const contentToDisplay = loginContent === 'login' ? loginButton : loginContent;
+    
+    const contentToDisplay = filteredGuilds !== null ? setupForm : loginPrompt;
 
     return `
     <!DOCTYPE html>
@@ -416,44 +432,14 @@ function getWebpageHtml(loginContent = 'login') {
             }
         </style>
         <script>
-            // Client-side logic for dynamic Server and Channel selection
+            // Client-side logic for dynamic Channel selection
             document.addEventListener('DOMContentLoaded', () => {
                 const guildSelect = document.getElementById('guildId');
                 const channelSelect = document.getElementById('channelId');
-                const form = document.querySelector('form[action="/start-tournament"]');
-
-                if (!guildSelect || !channelSelect || !form) return;
-
-                // 1. Fetch and populate the Server/Guild dropdown
-                const populateGuilds = async () => {
-                    try {
-                        // Use relative paths for API endpoints
-                        const response = await fetch('/api/guilds');
-                        const guilds = await response.json();
-
-                        guildSelect.innerHTML = '<option value="" disabled selected>Select a Server</option>';
-
-                        if (guilds.length === 0) {
-                            guildSelect.innerHTML = '<option value="" disabled selected>Bot not in any server</option>';
-                            guildSelect.disabled = true;
-                            return;
-                        }
-
-                        guilds.forEach(guild => {
-                            const option = document.createElement('option');
-                            option.value = guild.id;
-                            option.textContent = guild.name;
-                            guildSelect.appendChild(option);
-                        });
-                        guildSelect.disabled = false;
-
-                    } catch (error) {
-                        console.error('Error fetching guilds:', error);
-                        guildSelect.innerHTML = '<option value="" disabled selected>Error loading servers</option>';
-                    }
-                };
                 
-                // 2. Event listener for when a Server is selected
+                if (!guildSelect || !channelSelect) return;
+
+                // 1. Event listener for when a Server is selected
                 guildSelect.addEventListener('change', async (e) => {
                     const guildId = e.target.value;
                     channelSelect.innerHTML = '<option value="" disabled selected>Loading Channels...</option>';
@@ -462,6 +448,7 @@ function getWebpageHtml(loginContent = 'login') {
                     if (!guildId) return;
 
                     try {
+                        // Use the new API endpoint to fetch channels for the selected guild
                         const response = await fetch(\`/api/channels/\${guildId}\`);
                         const channels = await response.json();
 
@@ -484,9 +471,6 @@ function getWebpageHtml(loginContent = 'login') {
                         channelSelect.innerHTML = '<option value="" disabled selected>Error loading channels</option>';
                     }
                 });
-
-                // Initialize the guild population after a brief delay 
-                setTimeout(populateGuilds, 500);
             });
         </script>
     </head>
@@ -501,9 +485,8 @@ function getWebpageHtml(loginContent = 'login') {
 }
 
 /**
- * Generates the HTML to list invitable guilds (Only used after OAuth login for bot invite).
- * @param {Array<Object>} guilds - List of guilds the user is in.
- * @returns {string} HTML content.
+ * Generates the HTML to list invitable guilds (Only used for the explicit /invite route).
+ * [Invite logic remains mostly unchanged]
  */
 function getGuildListHtml(guilds) {
     // Filter for guilds where the user has Administrator permissions (BigInt 0x8)
@@ -515,9 +498,11 @@ function getGuildListHtml(guilds) {
 
     if (invitableGuilds.length === 0) {
         return `
-            <p style="color: var(--error-color);">You do not have Administrator permissions in any server to invite the bot.</p>
-            <p>Please ensure you are logged into the correct Discord account.</p>
-            <a href="/" style="text-decoration: none;"><button>Go Back</button></a>
+            <div class="message-box error">
+                <h2>No Servers Found</h2>
+                <p>You do not have Administrator permissions in any server to invite the bot.</p>
+            </div>
+            <a href="/" style="text-decoration: none;"><button>Return to Login</button></a>
         `;
     }
 
@@ -533,45 +518,51 @@ function getGuildListHtml(guilds) {
 
     return `
         <div class="message-box success">
-            <h2>Success!</h2>
-            <p>Logged in. Select a server to invite the bot:</p>
+            <h2>Invite Bot</h2>
+            <p>Select a server where you have admin rights to invite the bot:</p>
         </div>
         <ul class="guild-list">
             ${guildItems}
         </ul>
         <hr style="border-top: 1px solid var(--border-color); margin: 30px 0;">
-        <p>Return to the homepage to use the tournament setup form with servers the bot is already in.</p>
-        <a href="/" style="text-decoration: none;"><button>Return to Setup Form</button></a>
+        <a href="/" style="text-decoration: none;"><button>Return to Tournament Manager</button></a>
     `;
 }
 
 // --- EXPRESS SERVER (WEB APP ROUTES) ---
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// GET route: Serves the styled HTML form 
+// GET route: Default route now enforces login
 app.get('/', (req, res) => {
     if (client.isReady()) {
-        res.send(getWebpageHtml('login'));
+        // If no user information is available, show the login prompt (filteredGuilds = null)
+        res.send(getWebpageHtml(null));
     } else {
         res.status(503).send('<body style="background: var(--bg-color); color: var(--text-color); font-family: \'Inter\', sans-serif;">Bot not ready. Please wait a moment and refresh.</body>');
     }
 });
 
-// API Endpoint: Get list of guilds the bot is in
-app.get('/api/guilds', (req, res) => {
-    if (!client.isReady()) {
-        return res.status(503).json([]);
+// Explicit invite link (requires login, but uses a different redirect)
+app.get('/discord/invite', (req, res) => {
+    if (!CLIENT_ID) {
+        return res.status(500).send('<body style="background: black; color: white;">CLIENT_ID not set.</body>');
     }
-
-    const guilds = client.guilds.cache.map(guild => ({
-        id: guild.id,
-        name: guild.name,
-    })).sort((a, b) => a.name.localeCompare(b.name));
-
-    res.json(guilds);
+    const url = `${DISCORD_API_BASE}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(`${PUBLIC_URL}/discord/callback-invite`)}&scope=${encodeURIComponent(SCOPES)}`;
+    res.redirect(url);
 });
 
-// API Endpoint: Get text channels for a specific guild
+// Route 1: Redirects user to Discord's authorization page (Standard login for management form)
+app.get('/discord/login', (req, res) => {
+    if (!CLIENT_ID) {
+        return res.status(500).send('<body style="background: black; color: white;">CLIENT_ID not set. Cannot proceed with OAuth.</body>');
+    }
+    // Uses the standard REDIRECT_URI to return to the server-side logic
+    const url = `${DISCORD_API_BASE}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=${encodeURIComponent(SCOPES)}`;
+    res.redirect(url);
+});
+
+
+// API Endpoint: Get text channels for a specific guild (This remains accessible)
 app.get('/api/channels/:guildId', async (req, res) => {
     if (!client.isReady()) {
         return res.status(503).json([]);
@@ -602,17 +593,7 @@ app.get('/api/channels/:guildId', async (req, res) => {
     }
 });
 
-// Route 1: Redirects user to Discord's authorization page (For Bot Invite)
-app.get('/discord/login', (req, res) => {
-    if (!CLIENT_ID) {
-        return res.status(500).send('<body style="background: black; color: white;">CLIENT_ID not set in environment variables. Cannot proceed with OAuth.</body>');
-    }
-    // Uses the dynamic REDIRECT_URI
-    const url = `${DISCORD_API_BASE}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=${encodeURIComponent(SCOPES)}`;
-    res.redirect(url);
-});
-
-// Route 2: Receives the authorization code and exchanges it for an access token (For Bot Invite)
+// Route 2A: Receives the authorization code and exchanges it for an access token (for the main form)
 app.get('/discord/callback', async (req, res) => {
     const { code } = req.query;
 
@@ -639,7 +620,65 @@ app.get('/discord/callback', async (req, res) => {
         const { access_token } = tokenData;
 
         if (!access_token) {
-            console.error('Discord Token Error:', tokenData);
+            throw new Error('Failed to obtain access token.');
+        }
+
+        // Use token to get user's guilds
+        const userGuildsResponse = await fetch(`${DISCORD_API_BASE}/users/@me/guilds`, {
+            headers: { 'Authorization': `Bearer ${access_token}` },
+        });
+
+        const userGuilds = await userGuildsResponse.json();
+
+        if (!Array.isArray(userGuilds)) {
+            throw new Error('Failed to retrieve user guilds.');
+        }
+
+        // --- FILTERING LOGIC: Find intersection of User's guilds and Bot's guilds ---
+        const botGuildIds = client.guilds.cache.map(guild => guild.id);
+        
+        const filteredGuilds = userGuilds
+            .filter(userGuild => botGuildIds.includes(userGuild.id))
+            .map(g => ({ id: g.id, name: g.name })); // Keep only necessary data
+
+        // Render the main page, passing the filtered list directly
+        res.send(getWebpageHtml(filteredGuilds));
+
+    } catch (error) {
+        console.error('OAuth Flow Error (Management):', error);
+        res.status(500).send(getWebpageHtml(null)); // Redirect back to login prompt on error
+    }
+});
+
+
+// Route 2B: Receives the authorization code and exchanges it for an access token (for the invite flow)
+// This is a separate callback to prevent the token/guild list from being mistakenly used for the form.
+app.get('/discord/callback-invite', async (req, res) => {
+    const { code } = req.query;
+
+    if (!code) {
+        return res.redirect('/'); 
+    }
+
+    try {
+        // Exchange code for token
+        const tokenResponse = await fetch(`${DISCORD_API_BASE}/oauth2/token`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: CLIENT_ID,
+                client_secret: CLIENT_SECRET,
+                grant_type: 'authorization_code',
+                code: code,
+                redirect_uri: `${PUBLIC_URL}/discord/callback-invite`, 
+                scope: SCOPES,
+            }),
+        });
+
+        const tokenData = await tokenResponse.json();
+        const { access_token } = tokenData;
+
+        if (!access_token) {
             throw new Error('Failed to obtain access token.');
         }
 
@@ -651,25 +690,21 @@ app.get('/discord/callback', async (req, res) => {
         const guilds = await guildsResponse.json();
 
         if (!Array.isArray(guilds)) {
-            console.error('Discord Guilds Error:', guilds);
             throw new Error('Failed to retrieve user guilds.');
         }
 
         // Render the list of invitable guilds
-        res.send(getWebpageHtml(getGuildListHtml(guilds)));
+        res.send(getWebpageHtml(null).replace(
+            /\{\{INJECTED_CONTENT\}\}/, // Placeholder for the injected content
+            getGuildListHtml(guilds)
+        ));
 
     } catch (error) {
-        console.error('OAuth Flow Error:', error);
-        res.status(500).send(getWebpageHtml(`
-            <div class="message-box error">
-                <h2>Authentication Error</h2>
-                <p>Could not complete the Discord login process. Please check your **CLIENT_ID** and **CLIENT_SECRET**.</p>
-                <p>Details: ${error.message}</p>
-                <a href="/">Try Logging In Again</a>
-            </div>
-        `));
+        console.error('OAuth Flow Error (Invite):', error);
+        res.status(500).send(getWebpageHtml(null));
     }
 });
+
 
 // POST route: Handles the form submission to start the tournament
 app.post('/start-tournament', async (req, res) => {
@@ -735,7 +770,7 @@ app.post('/start-tournament', async (req, res) => {
                 <h2>Success!</h2>
                 <p>Tournament **${name}** launched in Discord server **${channel.guild.name}**, channel <a href="https://discord.com/channels/${channel.guildId}/${channelId}" target="_blank">#${channel.name}</a>.</p>
                 <p>Registrations are now open.</p>
-                <a href="/">Launch Another Event</a>
+                <a href="/">Go Back to Manager</a>
             </div>
         `;
 
@@ -746,7 +781,7 @@ app.post('/start-tournament', async (req, res) => {
                 <h2>Error</h2>
                 <p>Could not start tournament.</p>
                 <p>Details: ${error.message}</p>
-                <a href="/">Go Back and Fix</a>
+                <a href="/">Go Back to Manager</a>
             </div>
         `;
     }
