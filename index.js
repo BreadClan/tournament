@@ -204,11 +204,12 @@ async function updateTournamentPost() {
 }
 
 /**
- * Generates the HTML based on whether the user is logged in (has filtered guilds) or not.
- * @param {Array<Object> | null} filteredGuilds - List of guilds the user is in AND the bot is in.
+ * Generates the HTML based on whether the user is logged in, or if custom content is provided.
+ * * @param {Array<Object> | null} filteredGuilds - List of guilds the user is in AND the bot is in (for management form).
+ * @param {string | null} customContent - HTML to display instead of the form or login prompt.
  * @returns {string} The full HTML content.
  */
-function getWebpageHtml(filteredGuilds = null) {
+function getWebpageHtml(filteredGuilds = null, customContent = null) {
     // --- 1. Generate the dropdown options based on the provided, filtered list ---
     let guildOptions = '<option value="" disabled selected>Select a Server</option>';
     let formDisabled = 'disabled';
@@ -261,9 +262,20 @@ function getWebpageHtml(filteredGuilds = null) {
                 🔗 Login with Discord
             </button>
         </a>
+        <hr style="border-top: 1px solid var(--border-color); margin: 30px 0;">
+        <p style="margin-bottom: 0;">Is your server missing? <a href="/discord/invite" style="color: var(--success-color); font-weight: 600;">Invite the bot here</a>.</p>
     `;
     
-    const contentToDisplay = filteredGuilds !== null ? setupForm : loginPrompt;
+    // --- 4. Determine content to display ---
+    let contentToDisplay;
+    if (customContent !== null) {
+        contentToDisplay = customContent;
+    } else if (filteredGuilds !== null) {
+        contentToDisplay = setupForm;
+    } else {
+        contentToDisplay = loginPrompt;
+    }
+
 
     return `
     <!DOCTYPE html>
@@ -652,7 +664,7 @@ app.get('/discord/callback', async (req, res) => {
 
 
 // Route 2B: Receives the authorization code and exchanges it for an access token (for the invite flow)
-// This is a separate callback to prevent the token/guild list from being mistakenly used for the form.
+// FIX: The rendering logic now correctly uses the customContent parameter in getWebpageHtml.
 app.get('/discord/callback-invite', async (req, res) => {
     const { code } = req.query;
 
@@ -670,6 +682,7 @@ app.get('/discord/callback-invite', async (req, res) => {
                 client_secret: CLIENT_SECRET,
                 grant_type: 'authorization_code',
                 code: code,
+                // IMPORTANT: This URI must be registered in the Discord Developer Portal
                 redirect_uri: `${PUBLIC_URL}/discord/callback-invite`, 
                 scope: SCOPES,
             }),
@@ -693,15 +706,21 @@ app.get('/discord/callback-invite', async (req, res) => {
             throw new Error('Failed to retrieve user guilds.');
         }
 
-        // Render the list of invitable guilds
-        res.send(getWebpageHtml(null).replace(
-            /\{\{INJECTED_CONTENT\}\}/, // Placeholder for the injected content
-            getGuildListHtml(guilds)
-        ));
+        // Render the list of invitable guilds using the new custom content parameter
+        res.send(getWebpageHtml(null, getGuildListHtml(guilds)));
 
     } catch (error) {
         console.error('OAuth Flow Error (Invite):', error);
-        res.status(500).send(getWebpageHtml(null));
+        // If the error is an OAuth error, it often means the redirect URI is bad.
+        res.status(500).send(`
+            <body style="background: var(--bg-color); color: var(--text-color); font-family: 'Inter', sans-serif;">
+                <div class="card-container" style="max-width: 500px; margin: auto; padding: 2rem; background: #1f1f1f; border-radius: 0.5rem; color: #f3f4f6; text-align: center;">
+                    <h2>OAuth Error</h2>
+                    <p>There was an error logging you in. This usually means the **redirect URI** in the Discord Developer Portal is incorrect or missing the path: <strong>/discord/callback-invite</strong>.</p>
+                    <a href="/" style="color: #4ade80; text-decoration: none; font-weight: 600;">Return to Login</a>
+                </div>
+            </body>
+        `);
     }
 });
 
