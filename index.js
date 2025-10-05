@@ -2,37 +2,23 @@
 
 // --- Imports ---
 const { 
-    Client, GatewayIntentBits, Partials, SlashCommandBuilder, EmbedBuilder, ChannelType, 
-    PermissionsBitField 
+    Client, GatewayIntentBits, Partials, SlashCommandBuilder, EmbedBuilder, 
+    PermissionsBitField, ChannelType
 } = require('discord.js');
 const express = require('express');
 const bodyParser = require('body-parser');
-// Requires the '@napi-rs/canvas' package for image generation
 const { createCanvas } = require('@napi-rs/canvas'); 
+const fetch = require('node-fetch'); // Required for Discord API calls
 
 // --- Configuration & Initialization ---
 
 // Read environment variables (MUST be set in your hosting environment)
 const TOKEN = process.env.DISCORD_TOKEN; 
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
-const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET; // REQUIRED for OAuth
+const REDIRECT_URI = process.env.REDIRECT_URI; // REQUIRED, e.g., https://your-app-url.com/auth/discord/callback
 
-// 1. DYNAMIC PORT: Use the port provided by the hosting environment
 const PORT = process.env.PORT || 3000; 
-
-// 2. DYNAMIC PUBLIC URL: This is the critical URL that must be registered in Discord's Developer Portal.
-// The hardcoded RENDER_HOST_URL is used as a fallback if PUBLIC_URL isn't set, ensuring it points to the correct domain.
-const RENDER_HOST_URL = 'https://bread-tournament-bot.onrender.com';
-const PUBLIC_URL = process.env.PUBLIC_URL || RENDER_HOST_URL || `http://localhost:${PORT}`;
-
-const DISCORD_API_BASE = 'https://discord.com/api/v10';
-// Standard Redirect URI for the Tournament Management Form
-const REDIRECT_URI = `${PUBLIC_URL}/discord/callback`; 
-// Invite-specific Redirect URI (MUST be registered in Discord's Developer Portal)
-const INVITE_REDIRECT_URI = `${PUBLIC_URL}/discord/callback-invite`;
-
-const SCOPES = 'identify guilds'; // We need 'guilds' to see which servers the user is in
-const BOT_PERMISSIONS = '8'; // Administrator (for simplicity in this example)
 
 const client = new Client({ 
     intents: [
@@ -45,6 +31,8 @@ const client = new Client({
 });
 
 const app = express();
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
 
 // Global state for the single active tournament
 const tournamentState = {
@@ -54,10 +42,32 @@ const tournamentState = {
     // Participants stored as { id: 'userID', username: 'username' }
     participants: [], 
     details: {},
-    bracket: [] // Structured array for pairings and advancement
+    // bracket structure: { matchId: number, p1: string, p2: string, winner: string | null }
+    bracket: [] 
 };
 
 // --- UTILITY FUNCTIONS ---
+
+/**
+ * Filters the guilds a user is in to only show those where the bot is also present 
+ * and the user has Administrator permissions (MANAGE_GUILD is enough for this check).
+ * @param {Array<Object>} userGuilds - Guilds fetched from the Discord API.
+ * @param {Client} botClient - The Discord bot client.
+ * @returns {Array<Object>} Filtered list of manageable guilds.
+ */
+function getBotGuilds(userGuilds, botClient) {
+    if (!botClient.isReady()) return [];
+    
+    const botGuildIds = botClient.guilds.cache.map(guild => guild.id);
+    
+    // Check for ADMINISTRATOR permission (Bit 3: 0x8)
+    const ADMIN_PERMISSION_BIT = 0x8; 
+
+    return userGuilds.filter(guild => 
+        botGuildIds.includes(guild.id) && 
+        (Number(guild.permissions) & ADMIN_PERMISSION_BIT) === ADMIN_PERMISSION_BIT
+    );
+}
 
 /**
  * Generates initial pairings for a single-elimination tournament.
@@ -66,7 +76,6 @@ const tournamentState = {
  * @returns {Array<{p1: string, p2: string, matchId: number, winner: string | null}>}
  */
 function generatePairings(players) {
-    // Check for array validity
     if (!players || players.length < 2) {
         return [];
     }
@@ -79,18 +88,26 @@ function generatePairings(players) {
     }
     const padding = nextPowerOfTwo - shuffledPlayers.length;
     for (let i = 0; i < padding; i++) {
-        // Use a placeholder object for BYE
         shuffledPlayers.push({ id: 'BYE', username: 'BYE' });
     }
 
     const pairings = [];
-    // Standard randomized single-elim bracket seed (1 vs N, 2 vs N-1, etc.)
     for (let i = 0; i < shuffledPlayers.length / 2; i++) {
+        const p1 = shuffledPlayers[i];
+        const p2 = shuffledPlayers[shuffledPlayers.length - 1 - i];
+        
+        let winner = null;
+        if (p1.username === 'BYE') {
+            winner = p2.username;
+        } else if (p2.username === 'BYE') {
+            winner = p1.username;
+        }
+
         pairings.push({
             matchId: i + 1,
-            p1: shuffledPlayers[i].username,
-            p2: shuffledPlayers[shuffledPlayers.length - 1 - i].username,
-            winner: null
+            p1: p1.username,
+            p2: p2.username,
+            winner: winner
         });
     }
     
@@ -98,86 +115,93 @@ function generatePairings(players) {
 }
 
 /**
- * Draws the tournament bracket using the canvas library.
+ * Draws the tournament bracket using the canvas library. 
+ * Renders a clean single-round bracket image.
  * @param {Array<Object>} pairings - The current round's match list.
  * @returns {Buffer} PNG image buffer.
  */
 async function drawTournamentBracket(pairings) {
-    const WIDTH = 800;
-    const HEIGHT = 600;
-    // Calculate required height dynamically based on the number of matches
+    const MATCH_COUNT = pairings.length;
+    // Base dimensions and spacing
+    const BOX_WIDTH = 250;
     const BOX_HEIGHT = 40;
-    const MATCH_SPACING = 10;
-    const totalMatchHeight = pairings.length * (BOX_HEIGHT * 2 + MATCH_SPACING);
-    const requiredHeight = Math.max(HEIGHT, totalMatchHeight + 80); 
+    const SPACING = 20;
+    const MARGIN = 30;
+    const TEXT_SIZE = 18;
 
-    const canvas = createCanvas(WIDTH, requiredHeight);
+    const requiredHeight = MATCH_COUNT * (BOX_HEIGHT * 2 + SPACING) + MARGIN * 2;
+    const requiredWidth = BOX_WIDTH * 2 + MARGIN * 2 + 50; 
+    
+    const canvas = createCanvas(requiredWidth, Math.max(200, requiredHeight));
     const ctx = canvas.getContext('2d');
     
-    const BOX_WIDTH = 180;
-    const FONT_SIZE = 16;
-    const LINE_COLOR = '#6366f1'; 
+    const LINE_COLOR = '#4f46e5'; // Indigo
     const TEXT_COLOR = '#f3f4f6';
-    const WINNER_COLOR = '#4ade80'; 
+    const WINNER_COLOR = '#4ade80'; // Green
 
     ctx.fillStyle = '#111827'; 
-    ctx.fillRect(0, 0, WIDTH, requiredHeight); // Fill background
+    ctx.fillRect(0, 0, requiredWidth, requiredHeight);
     
-    ctx.font = `${FONT_SIZE}px sans-serif`;
-    ctx.fillStyle = TEXT_COLOR;
+    ctx.font = `600 ${TEXT_SIZE}px Inter, sans-serif`;
     ctx.textAlign = 'left';
 
-    ctx.fillText('Tournament Bracket - Current Round', 20, 30);
-    
-    const startY = 60;
-    const startX = 20;
+    let currentY = MARGIN;
 
     // Draw Matches
-    pairings.forEach((match, index) => {
-        const y = startY + index * (BOX_HEIGHT * 2 + MATCH_SPACING);
+    pairings.forEach(match => {
+        const y = currentY;
+        const x = MARGIN;
         
+        // --- Draw Match Box Outline ---
         ctx.strokeStyle = LINE_COLOR;
-        ctx.lineWidth = 2;
-        ctx.strokeRect(startX, y, BOX_WIDTH, BOX_HEIGHT * 2);
+        ctx.lineWidth = 3;
+        // Use rect and strokeRect to draw two boxes connected by a line
+        ctx.strokeRect(x, y, BOX_WIDTH, BOX_HEIGHT * 2);
 
-        // Player 1
-        let p1Color = match.winner === match.p1 ? WINNER_COLOR : TEXT_COLOR;
-        ctx.fillStyle = p1Color;
-        ctx.fillText(match.p1, startX + 10, y + BOX_HEIGHT / 2 + 5);
-        
-        // Player 2
-        let p2Color = match.winner === match.p2 ? WINNER_COLOR : TEXT_COLOR;
-        ctx.fillStyle = p2Color;
-        ctx.fillText(match.p2, startX + 10, y + BOX_HEIGHT * 1.5 + 5);
-
-        // Separator Line
+        // --- Separator Line ---
         ctx.beginPath();
-        ctx.moveTo(startX, y + BOX_HEIGHT);
-        ctx.lineTo(startX + BOX_WIDTH, y + BOX_HEIGHT);
+        ctx.moveTo(x, y + BOX_HEIGHT);
+        ctx.lineTo(x + BOX_WIDTH, y + BOX_HEIGHT);
         ctx.strokeStyle = LINE_COLOR;
+        ctx.lineWidth = 1;
         ctx.stroke();
+        
+        // --- Player 1 Name ---
+        ctx.fillStyle = match.winner === match.p1 ? WINNER_COLOR : TEXT_COLOR;
+        ctx.fillText(match.p1, x + 10, y + BOX_HEIGHT * 0.5 + TEXT_SIZE / 2 - 5);
+        
+        // --- Player 2 Name ---
+        ctx.fillStyle = match.winner === match.p2 ? WINNER_COLOR : TEXT_COLOR;
+        ctx.fillText(match.p2, x + 10, y + BOX_HEIGHT * 1.5 + TEXT_SIZE / 2 - 5);
 
-        // Line connecting to next round placeholder
+        // --- Connection Line to Winner Spot ---
         const midY = y + BOX_HEIGHT;
         ctx.beginPath();
-        ctx.moveTo(startX + BOX_WIDTH, midY);
-        ctx.lineTo(startX + BOX_WIDTH + 50, midY); 
+        ctx.moveTo(x + BOX_WIDTH, midY);
+        ctx.lineTo(x + BOX_WIDTH + 50, midY); 
+        ctx.strokeStyle = LINE_COLOR;
+        ctx.lineWidth = 3;
         ctx.stroke();
 
-        // Draw winner placeholder
-        ctx.fillStyle = '#a1a1aa';
+        // --- Winner Text Placeholder/Actual Winner ---
+        ctx.font = `500 ${TEXT_SIZE}px Inter, sans-serif`;
+        const winnerTextX = x + BOX_WIDTH + 60;
+        
         if (match.winner) {
             ctx.fillStyle = WINNER_COLOR;
-            ctx.fillText(`> ${match.winner}`, startX + BOX_WIDTH + 60, midY + 5);
+            ctx.fillText(`> ${match.winner.toUpperCase()}`, winnerTextX, midY + TEXT_SIZE / 2 - 5);
         } else {
-             ctx.fillText('WINNER PENDING', startX + BOX_WIDTH + 60, midY + 5);
+             ctx.fillStyle = '#a1a1aa'; // Gray
+             ctx.fillText('PENDING', winnerTextX, midY + TEXT_SIZE / 2 - 5);
         }
 
+        currentY += (BOX_HEIGHT * 2 + SPACING);
         ctx.fillStyle = TEXT_COLOR; 
     });
 
     return canvas.toBuffer('image/png');
 }
+
 
 /**
  * Updates the Discord message with the latest participants and bracket image.
@@ -190,26 +214,38 @@ async function updateTournamentPost() {
         if (!channel) return;
         const message = await channel.messages.fetch(tournamentState.messageId);
 
-        // Only generate pairings if the tournament is active and has participants, but no bracket yet.
         if (tournamentState.bracket.length === 0 && tournamentState.participants.length > 1 && tournamentState.isActive) {
             tournamentState.bracket = generatePairings(tournamentState.participants);
         }
         
+        let finalWinner = null;
+        if (!tournamentState.isActive && tournamentState.bracket.length === 1) {
+            finalWinner = tournamentState.bracket[0].winner;
+        }
+
         const imageBuffer = await drawTournamentBracket(tournamentState.bracket);
         
         const participantList = tournamentState.participants.length > 0 
             ? tournamentState.participants.map(p => `• ${p.username}`).join('\n') 
             : 'No one has joined yet.';
         
+        const embedTitle = finalWinner 
+            ? `👑 CHAMPION: ${finalWinner.toUpperCase()}`
+            : `🏆 ${tournamentState.details.name}`;
+
+        const embedDescription = tournamentState.isActive 
+            ? `React with ✅ below to join! Current Participants:` 
+            : `This tournament has concluded. Congratulations to **${finalWinner}**!`;
+
         const newEmbed = new EmbedBuilder()
-            .setTitle(`🏆 ${tournamentState.details.name}`)
-            .setDescription(tournamentState.isActive ? `React with ✅ below to join! Current participants:` : 'This tournament has concluded or been cancelled.')
+            .setTitle(embedTitle)
+            .setDescription(embedDescription)
             .addFields(
                 { name: 'Prize', value: tournamentState.details.prize, inline: true },
                 { name: 'Entry Fee', value: tournamentState.details.entryFee || 'Free', inline: true },
                 { name: `Participants (${tournamentState.participants.length})`, value: participantList.substring(0, 1024), inline: false }
             )
-            .setColor(tournamentState.isActive ? 0x6366f1 : 0xef4444) // Purple when active, Red when ended
+            .setColor(tournamentState.isActive ? 0x6366f1 : 0x4ade80)
             .setImage('attachment://tournament-bracket.png'); 
             
         await message.edit({ 
@@ -225,88 +261,17 @@ async function updateTournamentPost() {
     }
 }
 
-/**
- * Generates the HTML based on whether the user is logged in, or if custom content is provided.
- * @param {Array<Object> | null} filteredGuilds - List of guilds the user is in AND the bot is in.
- * @param {string | null} customContent - HTML to display instead of the form or login prompt.
- * @returns {string} The full HTML content.
- */
-function getWebpageHtml(filteredGuilds = null, customContent = null) {
-    // --- 1. Generate the dropdown options based on the provided, filtered list ---
-    let guildOptions = '<option value="" disabled selected>Select a Server</option>';
-    let formDisabled = 'disabled';
+// --- EXPRESS SERVER (WEB APP ROUTES) ---
+
+// 1. Initial Login Page
+app.get('/', (req, res) => {
+    const authUrl = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=identify%20guilds`;
     
-    if (filteredGuilds && filteredGuilds.length > 0) {
-        formDisabled = '';
-        const sortedGuilds = filteredGuilds.sort((a, b) => a.name.localeCompare(b.name));
-        guildOptions = sortedGuilds.map(guild => 
-            `<option value="${guild.id}">${guild.name}</option>`
-        ).join('');
-    } else if (filteredGuilds) {
-        // Logged in, but bot is not in any of the user's servers
-        guildOptions = '<option value="" disabled selected>Bot not in any of your servers</option>';
-    }
+    // Simple HTML response for the root page
+    const activeStatus = tournamentState.isActive ? 'block' : 'none';
+    const launchDisplay = tournamentState.isActive ? 'none' : 'block';
 
-    // --- 2. The main form content ---
-    const setupForm = `
-        ${tournamentState.isActive ? `
-            <div class="message-box error">
-                <h2>Tournament Active!</h2>
-                <p>A tournament is currently active in Discord. Please use the **/endtournament** command on your server to reset the state and launch a new one.</p>
-            </div>
-        ` : ''}
-
-        <p>Define the parameters to launch the tournament registration on Discord.</p>
-        <form action="/start-tournament" method="POST">
-            <label for="name">Tournament Name</label>
-            <input type="text" id="name" name="name" placeholder="e.g., Spring Smash 2024" required>
-            
-            <label for="prize">Prize Details</label>
-            <input type="text" id="prize" name="prize" placeholder="e.g., $50 Nitro, Custom Role" required>
-            
-            <label for="entryFee">Entry Fee (Optional)</label>
-            <input type="text" id="entryFee" name="entryFee" placeholder="e.g., Free, 5,000 Gold, or None">
-
-            <label for="guildId">Target Discord Server</label>
-            <select id="guildId" name="guildId" required ${formDisabled} ${tournamentState.isActive ? 'disabled' : ''}>
-                ${guildOptions}
-            </select>
-            
-            <label for="channelId">Target Discord Channel</label>
-            <select id="channelId" name="channelId" required disabled ${tournamentState.isActive ? 'disabled' : ''}>
-                <option value="" disabled selected>Select a Server First</option>
-            </select>
-            
-            <button type="submit" ${formDisabled || tournamentState.isActive ? 'disabled' : ''}>🚀 Launch Registration Event</button>
-        </form>
-        <hr style="border-top: 1px solid var(--border-color); margin: 30px 0;">
-        <p style="margin-bottom: 0;">Is your server missing? <a href="/discord/invite" style="color: var(--success-color); font-weight: 600;">Invite the bot here</a>.</p>
-    `;
-
-    // --- 3. The login content if not logged in ---
-    const loginPrompt = `
-        <p>You must log in with Discord to manage tournaments and see only your servers.</p>
-        <a href="/discord/login" style="text-decoration: none;">
-            <button type="button" style="background-color: #5865F2; /* Discord Blurple */">
-                🔗 Login with Discord
-            </button>
-        </a>
-        <hr style="border-top: 1px solid var(--border-color); margin: 30px 0;">
-        <p style="margin-bottom: 0;">Is your server missing? <a href="/discord/invite" style="color: var(--success-color); font-weight: 600;">Invite the bot here</a>.</p>
-    `;
-    
-    // --- 4. Determine content to display ---
-    let contentToDisplay;
-    if (customContent !== null) {
-        contentToDisplay = customContent;
-    } else if (filteredGuilds !== null) {
-        contentToDisplay = setupForm;
-    } else {
-        contentToDisplay = loginPrompt;
-    }
-
-
-    return `
+    res.send(`
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -314,479 +279,211 @@ function getWebpageHtml(filteredGuilds = null, customContent = null) {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Tournament Bot Manager</title>
         <style>
+            /* Basic styling for the web manager */
             :root {
                 --bg-color: #0c0c0c;
                 --card-color: #1f1f1f;
                 --text-color: #f3f4f6;
-                --input-bg: #2d2d2d;
-                --border-color: #3f3f3f;
                 --accent-color: #6366f1; 
-                --success-color: #4ade80; 
                 --error-color: #ef4444; 
             }
-
             body {
                 background-color: var(--bg-color);
                 color: var(--text-color);
                 font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
-                margin: 0;
                 min-height: 100vh;
                 display: flex;
                 align-items: center;
                 justify-content: center;
                 padding: 20px;
             }
-            
             .card-container {
                 max-width: 500px;
                 width: 100%;
                 background-color: var(--card-color);
                 padding: 2.5rem;
                 border-radius: 1rem;
-                border: 1px solid var(--border-color);
                 box-shadow: 0 10px 15px rgba(0, 0, 0, 0.5);
-            }
-
-            h1 {
-                font-size: 1.875rem;
-                font-weight: 700;
-                margin-bottom: 0.5rem;
-                color: var(--text-color);
                 text-align: center;
             }
-            
-            p {
-                color: #a1a1aa;
-                margin-bottom: 2rem;
-                text-align: center;
-            }
-
-            label {
-                display: block;
-                font-size: 0.875rem;
-                font-weight: 500;
-                margin-bottom: 0.5rem;
-                color: var(--text-color);
-            }
-
-            input[type="text"], select {
-                width: 100%;
-                padding: 0.75rem 1rem;
-                margin-bottom: 1.5rem;
-                background-color: var(--input-bg);
-                border: 1px solid var(--border-color);
-                border-radius: 0.5rem;
-                color: var(--text-color);
-                transition: border-color 0.2s, box-shadow 0.2s;
-                box-sizing: border-box;
-            }
-            
-            input[type="text"]:focus, select:focus {
-                border-color: var(--accent-color);
-                outline: none;
-                box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.4);
-            }
-            
-            button {
-                width: 100%;
-                padding: 0.75rem;
+            h1 { font-size: 1.875rem; margin-bottom: 0.5rem; }
+            p.sub { color: #a1a1aa; margin-bottom: 2rem; }
+            a.login-button {
+                display: inline-block;
+                padding: 1rem 2rem;
                 background-color: var(--accent-color);
                 color: white;
                 font-weight: 600;
-                border: none;
-                border-radius: 0.5rem;
-                cursor: pointer;
-                transition: background-color 0.2s, transform 0.1s;
-                font-size: 1rem;
-                letter-spacing: 0.05em;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
-                margin-top: 10px;
-            }
-
-            button:hover:not(:disabled) {
-                background-color: #4f46e5;
-            }
-            
-            button:active:not(:disabled) {
-                transform: scale(0.99);
-            }
-            
-            button:disabled {
-                background-color: #4b5563;
-                cursor: not-allowed;
-            }
-
-            /* Guild List Specific Styles */
-            .guild-list {
-                list-style: none;
-                padding: 0;
-            }
-            .guild-item {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                padding: 10px 0;
-                border-bottom: 1px solid var(--border-color);
-            }
-            .guild-item:last-child {
-                border-bottom: none;
-            }
-            .guild-invite-btn {
-                background-color: var(--success-color);
-                color: #111827;
-                padding: 8px 12px;
                 border-radius: 0.5rem;
                 text-decoration: none;
-                font-weight: 700;
                 transition: background-color 0.2s;
+                font-size: 1.125rem;
             }
-            .guild-invite-btn:hover {
-                background-color: #22c55e;
-            }
-            .guild-name {
-                font-weight: 600;
-            }
-
-            /* Message Styling */
+            a.login-button:hover { background-color: #4f46e5; }
             .message-box {
                 padding: 1.5rem;
                 border-radius: 0.5rem;
                 margin-bottom: 20px;
                 text-align: center;
-            }
-            .message-box.success {
-                background-color: rgba(74, 222, 128, 0.1);
-                border: 1px solid var(--success-color);
-                color: var(--success-color);
-            }
-            .message-box.error {
                 background-color: rgba(239, 68, 68, 0.1);
                 border: 1px solid var(--error-color);
                 color: var(--error-color);
+                display: ${activeStatus};
             }
-            .message-box h2 {
-                margin-top: 0;
-                font-size: 1.5rem;
-            }
-            .message-box a {
-                color: var(--success-color);
-                text-decoration: none;
-                font-weight: 600;
-            }
-            .message-box a:hover {
-                text-decoration: underline;
-            }
+            .login-section { display: ${launchDisplay}; }
         </style>
-        <script>
-            // Client-side logic for dynamic Channel selection
-            document.addEventListener('DOMContentLoaded', () => {
-                const guildSelect = document.getElementById('guildId');
-                const channelSelect = document.getElementById('channelId');
-                
-                if (!guildSelect || !channelSelect) return;
-
-                // 1. Event listener for when a Server is selected
-                guildSelect.addEventListener('change', async (e) => {
-                    const guildId = e.target.value;
-                    channelSelect.innerHTML = '<option value="" disabled selected>Loading Channels...</option>';
-                    channelSelect.disabled = true;
-                    // Disable the submit button until a channel is selected
-                    const submitButton = document.querySelector('button[type="submit"]');
-                    if (submitButton) submitButton.disabled = true;
-
-
-                    if (!guildId) return;
-
-                    try {
-                        // Use the new API endpoint to fetch channels for the selected guild
-                        const response = await fetch(\`/api/channels/\${guildId}\`);
-                        const channels = await response.json();
-
-                        channelSelect.innerHTML = '<option value="" disabled selected>Select a Channel</option>';
-                        
-                        if (channels.length === 0) {
-                            channelSelect.innerHTML = '<option value="" disabled selected>No Text Channels found</option>';
-                            channelSelect.disabled = true;
-                        } else {
-                            channels.forEach(channel => {
-                                const option = document.createElement('option');
-                                option.value = channel.id;
-                                option.textContent = \`# \${channel.name}\`;
-                                channelSelect.appendChild(option);
-                            });
-                            channelSelect.disabled = false;
-                        }
-
-                    } catch (error) {
-                        console.error('Error fetching channels:', error);
-                        channelSelect.innerHTML = '<option value="" disabled selected>Error loading channels</option>';
-                        channelSelect.disabled = true;
-                    }
-                });
-
-                // 2. Enable submit button once a channel is selected (if not already disabled by active tournament)
-                 channelSelect.addEventListener('change', () => {
-                    const submitButton = document.querySelector('button[type="submit"]');
-                    if (submitButton && channelSelect.value !== "") {
-                        // Check if the form is generally disabled (e.g., if a tournament is active)
-                        if (!submitButton.hasAttribute('disabled')) {
-                            submitButton.disabled = false;
-                        }
-                    }
-                });
-            });
-        </script>
     </head>
     <body>
         <div class="card-container">
-            <h1>Tournament Bot 🤖</h1>
-            ${contentToDisplay}
+            <h1>Tournament Bot Manager 🏆</h1>
+            <p class="sub">Log in with Discord to select a server and launch your tournament registration event.</p>
+            
+            <div class="message-box">
+                <h2>Tournament Active!</h2>
+                <p>A tournament is currently active. Please use the **/endtournament** command in Discord to launch a new one.</p>
+            </div>
+
+            <div class="login-section">
+                <a href="${authUrl}" class="login-button">Login with Discord</a>
+            </div>
         </div>
     </body>
     </html>
-    `;
-}
-
-/**
- * Generates the HTML to list invitable guilds (Only used for the explicit /invite route).
- * @param {Array<Object>} guilds - List of guilds the user is in.
- * @returns {string} HTML content for the invite page.
- */
-function getGuildListHtml(guilds) {
-    // Filter for guilds where the user has Administrator permissions (BigInt 0x8)
-    const invitableGuilds = guilds.filter(guild => {
-        // Use PermissionsBitField to check for Administrator
-        const permission = new PermissionsBitField(BigInt(guild.permissions));
-        return permission.has(PermissionsBitField.Flags.Administrator);
-    });
-
-    if (invitableGuilds.length === 0) {
-        return `
-            <div class="message-box error">
-                <h2>No Admin Servers Found</h2>
-                <p>You must have Administrator permissions in a server to invite the bot.</p>
-            </div>
-            <a href="/" style="text-decoration: none;"><button>Return to Manager</button></a>
-        `;
-    }
-
-    const guildItems = invitableGuilds.map(guild => {
-        // Ensure the correct BOT_PERMISSIONS are used in the invite URL
-        const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&permissions=${BOT_PERMISSIONS}&scope=bot&guild_id=${guild.id}`;
-        return `
-            <li class="guild-item">
-                <span class="guild-name">${guild.name}</span>
-                <a class="guild-invite-btn" href="${inviteUrl}" target="_blank">Invite Bot</a>
-            </li>
-        `;
-    }).join('');
-
-    return `
-        <div class="message-box success">
-            <h2>Invite Bot</h2>
-            <p>Select a server where you have admin rights to invite the bot:</p>
-        </div>
-        <ul class="guild-list">
-            ${guildItems}
-        </ul>
-        <hr style="border-top: 1px solid var(--border-color); margin: 30px 0;">
-        <a href="/" style="text-decoration: none;"><button>Return to Tournament Manager</button></a>
-    `;
-}
-
-// --- EXPRESS SERVER (WEB APP ROUTES) ---
-app.use(bodyParser.urlencoded({ extended: true }));
-
-// GET route: Default route now enforces login
-app.get('/', (req, res) => {
-    if (client.isReady()) {
-        // If no user information is available, show the login prompt (filteredGuilds = null)
-        res.send(getWebpageHtml(null));
-    } else {
-        res.status(503).send('<body style="background: #0c0c0c; color: #f3f4f6; font-family: \'Inter\', sans-serif; text-align: center; padding-top: 50px;">Bot not ready. Please wait a moment and refresh.</body>');
-    }
+    `);
 });
 
-// Explicit invite link (requires login, but uses a different redirect)
-app.get('/discord/invite', (req, res) => {
-    if (!CLIENT_ID) {
-        return res.status(500).send('<body style="background: #0c0c0c; color: #ef4444;">CLIENT_ID not set.</body>');
+// 2. OAuth Callback Handler
+app.get('/auth/discord/callback', async (req, res) => {
+    const code = req.query.code;
+    const errorPage = (msg) => `<body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif; text-align: center; padding-top: 50px;"><div style="background: #1f1f1f; padding: 2rem; border-radius: 0.5rem; border: 1px solid #ef4444;"><h2>Error!</h2><p>${msg}</p><a href="/" style="color: #4ade80;">Go Back</a></div></body>`;
+    
+    if (tournamentState.isActive) {
+        return res.status(400).send(errorPage('A tournament is already active. Please end it first in Discord.'));
     }
-    // Uses the INVITE_REDIRECT_URI which is the one you were troubleshooting
-    const url = `${DISCORD_API_BASE}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(INVITE_REDIRECT_URI)}&scope=${encodeURIComponent(SCOPES)}`;
-    res.redirect(url);
-});
-
-// Route 1: Redirects user to Discord's authorization page (Standard login for management form)
-app.get('/discord/login', (req, res) => {
-    if (!CLIENT_ID) {
-        return res.status(500).send('<body style="background: #0c0c0c; color: #ef4444;">CLIENT_ID not set. Cannot proceed with OAuth.</body>');
-    }
-    // Uses the standard REDIRECT_URI
-    const url = `${DISCORD_API_BASE}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=${encodeURIComponent(SCOPES)}`;
-    res.redirect(url);
-});
-
-
-// API Endpoint: Get text channels for a specific guild (This remains accessible)
-app.get('/api/channels/:guildId', async (req, res) => {
-    if (!client.isReady()) {
-        return res.status(503).json([]);
-    }
-    const guildId = req.params.guildId;
-
-    try {
-        const guild = await client.guilds.fetch(guildId);
-        if (!guild) {
-            return res.status(404).json([]);
-        }
-
-        const channels = await guild.channels.fetch();
-        // Filter for text channels (ChannelType.GuildText is 0)
-        const textChannels = channels
-            .filter(channel => channel.type === ChannelType.GuildText) 
-            .map(channel => ({
-                id: channel.id,
-                name: channel.name,
-            }))
-            .sort((a, b) => a.name.localeCompare(b.name));
-
-        res.json(textChannels);
-
-    } catch (error) {
-        console.error(`Error fetching channels for guild ${guildId}:`, error);
-        res.status(500).json([]);
-    }
-});
-
-// Route 2A: Receives the authorization code and exchanges it for an access token (for the main form)
-app.get('/discord/callback', async (req, res) => {
-    const { code } = req.query;
 
     if (!code) {
-        return res.redirect('/'); 
+        return res.redirect('/');
     }
 
     try {
-        // Exchange code for token
-        const tokenResponse = await fetch(`${DISCORD_API_BASE}/oauth2/token`, {
+        // Step 1: Exchange code for token
+        const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({
                 client_id: CLIENT_ID,
-                client_secret: CLIENT_SECRET,
+                client_secret: DISCORD_CLIENT_SECRET,
                 grant_type: 'authorization_code',
-                code: code,
-                redirect_uri: REDIRECT_URI, 
-                scope: SCOPES,
+                code,
+                redirect_uri: REDIRECT_URI,
+                scope: 'identify guilds'
             }),
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
         });
-
         const tokenData = await tokenResponse.json();
-        const { access_token } = tokenData;
+        const accessToken = tokenData.access_token;
 
-        if (!access_token) {
-            throw new Error('Failed to obtain access token.');
-        }
+        if (!accessToken) throw new Error(tokenData.error_description || 'Failed to retrieve access token.');
 
-        // Use token to get user's guilds
-        const userGuildsResponse = await fetch(`${DISCORD_API_BASE}/users/@me/guilds`, {
-            headers: { 'Authorization': `Bearer ${access_token}` },
+        // Step 2: Fetch User's Guilds
+        const guildsResponse = await fetch('https://discord.com/api/v10/users/@me/guilds', {
+            headers: { Authorization: `Bearer ${accessToken}` }
         });
+        const userGuilds = await guildsResponse.json();
 
-        const userGuilds = await userGuildsResponse.json();
+        if (!Array.isArray(userGuilds)) throw new Error('Failed to fetch user guilds.');
 
-        if (!Array.isArray(userGuilds)) {
-            throw new Error('Failed to retrieve user guilds.');
-        }
-
-        // --- FILTERING LOGIC: Find intersection of User's guilds and Bot's guilds ---
-        const botGuildIds = client.guilds.cache.map(guild => guild.id);
+        // Step 3: Filter Guilds
+        const manageableGuilds = getBotGuilds(userGuilds, client);
         
-        // Filter for guilds the bot is in AND the user has administrative permissions in
-        const filteredGuilds = userGuilds
-            .filter(userGuild => botGuildIds.includes(userGuild.id))
-            .filter(userGuild => new PermissionsBitField(BigInt(userGuild.permissions)).has(PermissionsBitField.Flags.Administrator))
-            .map(g => ({ id: g.id, name: g.name }));
-
-        // Render the main page, passing the filtered list directly
-        res.send(getWebpageHtml(filteredGuilds));
-
-    } catch (error) {
-        console.error('OAuth Flow Error (Management):', error);
-        res.status(500).send(`
-            <body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif; text-align: center; padding-top: 50px;">
-                <h2>Login Error</h2>
-                <p>An error occurred during Discord login. Ensure the Redirect URI: <strong>${REDIRECT_URI}</strong> is registered in your Discord Developer Portal.</p>
-                <a href="/" style="color: #4ade80;">Try Logging In Again</a>
-            </body>
-        `); 
-    }
-});
-
-
-// Route 2B: Receives the authorization code and exchanges it for an access token (for the invite flow)
-app.get('/discord/callback-invite', async (req, res) => {
-    const { code } = req.query;
-
-    if (!code) {
-        return res.redirect('/'); 
-    }
-
-    try {
-        // Exchange code for token
-        const tokenResponse = await fetch(`${DISCORD_API_BASE}/oauth2/token`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-                client_id: CLIENT_ID,
-                client_secret: CLIENT_SECRET,
-                grant_type: 'authorization_code',
-                code: code,
-                redirect_uri: INVITE_REDIRECT_URI, // Uses the specific INVITE_REDIRECT_URI
-                scope: SCOPES,
-            }),
-        });
-
-        const tokenData = await tokenResponse.json();
-        const { access_token } = tokenData;
-
-        if (!access_token) {
-            throw new Error('Failed to obtain access token.');
+        if (manageableGuilds.length === 0) {
+            const inviteLink = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&permissions=8&integration_type=0&scope=bot+applications.commands`;
+            return res.status(403).send(errorPage(`We couldn't find any servers where you have Administrator permissions and the bot is invited. Please **<a href="${inviteLink}" style="color: #4ade80;">invite the bot here</a>**.`));
         }
 
-        // Use token to get user's guilds
-        const guildsResponse = await fetch(`${DISCORD_API_BASE}/users/@me/guilds`, {
-            headers: { 'Authorization': `Bearer ${access_token}` },
-        });
+        // Step 4: Display Server/Channel Selection Form
+        const guildOptions = manageableGuilds.map(guild => 
+            `<option value="${guild.id}">${guild.name}</option>`
+        ).join('');
+        
+        res.send(`
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Launch Tournament</title>
+            <style>
+                :root {
+                    --bg-color: #0c0c0c;
+                    --card-color: #1f1f1f;
+                    --text-color: #f3f4f6;
+                    --input-bg: #2d2d2d;
+                    --border-color: #3f3f3f;
+                    --accent-color: #6366f1; 
+                }
+                body {
+                    background-color: var(--bg-color);
+                    color: var(--text-color);
+                    font-family: 'Inter', sans-serif;
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }
+                .card-container { max-width: 500px; width: 100%; background-color: var(--card-color); padding: 2.5rem; border-radius: 1rem; box-shadow: 0 10px 15px rgba(0, 0, 0, 0.5); }
+                h1 { font-size: 1.875rem; font-weight: 700; margin-bottom: 0.5rem; text-align: center; }
+                p.sub { color: #a1a1aa; margin-bottom: 2rem; text-align: center; }
+                label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 0.5rem; }
+                input[type="text"], select { width: 100%; padding: 0.75rem 1rem; margin-bottom: 1.5rem; background-color: var(--input-bg); border: 1px solid var(--border-color); border-radius: 0.5rem; color: var(--text-color); box-sizing: border-box; }
+                button { width: 100%; padding: 0.75rem; background-color: var(--accent-color); color: white; font-weight: 600; border: none; border-radius: 0.5rem; cursor: pointer; transition: background-color 0.2s; font-size: 1rem; margin-top: 10px; }
+                button:hover { background-color: #4f46e5; }
+                .info-block { background: var(--input-bg); padding: 1rem; border-radius: 0.5rem; margin-bottom: 2rem; font-size: 0.875rem; color: #a1a1aa; text-align: left; }
+                .info-block strong { color: var(--text-color); }
+            </style>
+        </head>
+        <body>
+            <div class="card-container">
+                <h1>Launch Event Details</h1>
+                <p class="sub">Select a server and configure your tournament event.</p>
 
-        const guilds = await guildsResponse.json();
+                <form action="/start-tournament" method="POST">
+                    <label for="guildId">Select Discord Server</label>
+                    <select id="guildId" name="guildId" required>
+                        ${guildOptions}
+                    </select>
+                    
+                    <label for="name">Tournament Name</label>
+                    <input type="text" id="name" name="name" placeholder="e.g., Spring Smash 2024" required>
+                    
+                    <label for="prize">Prize Details</label>
+                    <input type="text" id="prize" name="prize" placeholder="e.g., $50 Nitro, Custom Role" required>
+                    
+                    <label for="entryFee">Entry Fee (Optional)</label>
+                    <input type="text" id="entryFee" name="entryFee" placeholder="e.g., Free, 5,000 Gold, or None">
 
-        if (!Array.isArray(guilds)) {
-            throw new Error('Failed to retrieve user guilds.');
-        }
-
-        // Render the list of invitable guilds using the custom content parameter
-        res.send(getWebpageHtml(null, getGuildListHtml(guilds)));
-
-    } catch (error) {
-        console.error('OAuth Flow Error (Invite):', error);
-        // Provide clear feedback on potential redirect URI mismatch
-        res.status(500).send(`
-            <body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif; text-align: center; padding-top: 50px;">
-                <h2>Invite Error</h2>
-                <p>An error occurred during the invite process. Ensure the Redirect URI: <strong>${INVITE_REDIRECT_URI}</strong> is registered in your Discord Developer Portal.</p>
-                <a href="/discord/invite" style="color: #4ade80;">Try Inviting Again</a>
-            </body>
+                    <div class="info-block">
+                        <strong>Channel ID:</strong> Enable **Developer Mode** in Discord, right-click the text channel where you want the post, and select **Copy Channel ID**.
+                    </div>
+                    <label for="channelId">Target Discord Channel ID</label>
+                    <input type="text" id="channelId" name="channelId" placeholder="e.g., 876543210987654321" required pattern="[0-9]+" title="Must be a numerical Discord ID">
+                    
+                    <button type="submit">🚀 Launch Registration Event</button>
+                </form>
+            </div>
+        </body>
+        </html>
         `);
+
+    } catch (error) {
+        console.error('Discord OAuth Error:', error);
+        res.status(500).send(errorPage(`There was an OAuth error: ${error.message}`));
     }
 });
 
-
-// POST route: Handles the form submission to start the tournament
+// 3. POST route: Handles the form submission to start the tournament
 app.post('/start-tournament', async (req, res) => {
     if (tournamentState.isActive) {
-        // This should be blocked by the HTML form, but is here for server-side validation
         return res.status(400).send(`
             <body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif; text-align: center; padding-top: 50px;">
                 <div style="background: #1f1f1f; padding: 2rem; border-radius: 0.5rem; border: 1px solid #ef4444;">
@@ -800,15 +497,16 @@ app.post('/start-tournament', async (req, res) => {
 
     const { name, prize, guildId, channelId, entryFee } = req.body;
     
-    if (!name || !prize || !guildId || !channelId) {
-        return res.status(400).send('<body style="background: #0c0c0c; color: #f3f4f6;">Missing required details.</body>');
-    }
-    
     let htmlResponse;
     try {
-        const channel = await client.channels.fetch(channelId);
-        if (!channel || channel.type !== ChannelType.GuildText || channel.guildId !== guildId) { 
-            throw new Error('Invalid Channel ID or Channel does not belong to the selected server.');
+        const guild = await client.guilds.fetch(guildId);
+        if (!guild) {
+             throw new Error('Invalid Guild ID or the bot is not in that server.');
+        }
+
+        const channel = await guild.channels.fetch(channelId);
+        if (!channel || channel.type !== ChannelType.GuildText) { 
+            throw new Error('Invalid Channel ID or channel is not a text channel.');
         }
 
         // 1. Reset and Update Global State
@@ -829,9 +527,9 @@ app.post('/start-tournament', async (req, res) => {
             )
             .setColor(0x6366f1); 
 
+        // Send with an initial blank bracket image
         const message = await channel.send({ 
             embeds: [initialEmbed],
-            // Attach a blank image initially so we can edit it later.
             files: [{ 
                 attachment: await drawTournamentBracket([]), 
                 name: 'tournament-bracket.png' 
@@ -842,41 +540,31 @@ app.post('/start-tournament', async (req, res) => {
         tournamentState.messageId = message.id;
 
         htmlResponse = `
-            <div class="message-box success">
+            <div class="message-box success" style="border: 1px solid #4ade80; background-color: rgba(74, 222, 128, 0.1); color: #4ade80; padding: 1.5rem; border-radius: 0.5rem; text-align: center;">
                 <h2>Success!</h2>
-                <p>Tournament **${name}** launched in Discord server **${channel.guild.name}**, channel <a href="https://discord.com/channels/${channel.guildId}/${channelId}" target="_blank">#${channel.name}</a>.</p>
-                <p>Registrations are now open. Use **/updatewinner** to manage matches.</p>
-                <a href="/">Go Back to Manager</a>
+                <p>Tournament **${name}** launched in Discord server **${guild.name}**, channel **#${channel.name}**.</p>
+                <p>Registrations are open. Use Discord commands for management.</p>
+                <a href="/" style="color: #4ade80; text-decoration: none; font-weight: 600;">Go Back to Manager</a>
             </div>
         `;
 
     } catch (error) {
         console.error('Error starting tournament:', error);
         htmlResponse = `
-            <div class="message-box error">
+            <div class="message-box error" style="border: 1px solid #ef4444; background-color: rgba(239, 68, 68, 0.1); color: #ef4444; padding: 1.5rem; border-radius: 0.5rem; text-align: center;">
                 <h2>Error</h2>
-                <p>Could not start tournament.</p>
+                <p>Could not start tournament. Please verify the server and channel details.</p>
                 <p>Details: ${error.message}</p>
-                <a href="/">Go Back to Manager</a>
+                <a href="/" style="color: #4ade80; text-decoration: none; font-weight: 600;">Go Back to Login</a>
             </div>
         `;
     }
     
-    // Render the response page with the success/error message
     res.send(`
-        <body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif;">
-            <style>
-                :root {--bg-color: #0c0c0c;--card-color: #1f1f1f;--text-color: #f3f4f6;--input-bg: #2d2d2d;--border-color: #3f3f3f;--accent-color: #6366f1;--success-color: #4ade80;--error-color: #ef4444;}
-                body {background-color: var(--bg-color);color: var(--text-color);font-family: 'Inter', sans-serif;margin: 0;min-height: 100vh;display: flex;align-items: center;justify-content: center;padding: 20px;}
-                .card-container {max-width: 500px;width: 100%;background-color: var(--card-color);padding: 2.5rem;border-radius: 1rem;border: 1px solid var(--border-color);box-shadow: 0 10px 15px rgba(0, 0, 0, 0.5);}
-                .message-box {padding: 1.5rem;border-radius: 0.5rem;margin-top: 20px;text-align: center;}
-                .message-box.success {background-color: rgba(74, 222, 128, 0.1);border: 1px solid var(--success-color);color: var(--success-color);}
-                .message-box.error {background-color: rgba(239, 68, 68, 0.1);border: 1px solid var(--error-color);color: var(--error-color);}
-                .message-box h2 {margin-top: 0;font-size: 1.5rem;}
-                .message-box a {color: var(--success-color);text-decoration: none;font-weight: 600;}
-                .message-box a:hover {text-decoration: underline;}
-            </style>
-            <div class="card-container">${htmlResponse}</div>
+        <body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px;">
+            <div class="card-container" style="max-width: 500px; width: 100%; background-color: #1f1f1f; padding: 2.5rem; border-radius: 1rem; border: 1px solid #3f3f3f; box-shadow: 0 10px 15px rgba(0, 0, 0, 0.5);">
+                ${htmlResponse}
+            </div>
         </body>
     `);
 });
@@ -900,7 +588,7 @@ client.on('ready', () => {
         .setName('endtournament')
         .setDescription('Ends the current active tournament immediately (Admin only).');
 
-    // Register commands globally or guild-specific
+    // Register commands globally
     client.application.commands.set([
         updateWinnerCommand.toJSON(),
         endTournamentCommand.toJSON()
@@ -909,19 +597,18 @@ client.on('ready', () => {
 
 // Handler for the Reaction Sign-up
 client.on('messageReactionAdd', async (reaction, user) => {
-    // Only process reactions on the registration message, for the tick emoji, and not from the bot itself
-    if (user.bot || reaction.message.id !== tournamentState.messageId || reaction.emoji.name !== '✅') return;
-    if (!tournamentState.isActive) return;
+    if (user.bot || reaction.message.id !== tournamentState.messageId || reaction.emoji.name !== '✅' || !tournamentState.isActive) return;
 
     try {
-        // Fetch the full user details if not cached (needed for username)
-        const fetchedUser = await client.users.fetch(user.id);
-
-        // Check if user is already in the list
-        if (!tournamentState.participants.some(p => p.id === fetchedUser.id)) {
+        if (!tournamentState.participants.some(p => p.id === user.id)) {
+            const fetchedUser = await client.users.fetch(user.id);
             tournamentState.participants.push({ id: fetchedUser.id, username: fetchedUser.username });
             console.log(`${fetchedUser.username} joined the tournament.`);
-            // Update the post for "live" effect
+            
+            if (tournamentState.participants.length >= 2 && tournamentState.bracket.length === 0) {
+                 tournamentState.bracket = generatePairings(tournamentState.participants);
+            }
+
             await updateTournamentPost();
         }
     } catch (e) {
@@ -933,7 +620,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    // --- Permissions Check (only needed for management commands) ---
+    // --- Permissions Check (for management commands) ---
     const memberPermissions = interaction.member?.permissions;
     const isAdmin = memberPermissions && memberPermissions.has(PermissionsBitField.Flags.Administrator);
 
@@ -947,8 +634,7 @@ client.on('interactionCreate', async interaction => {
         }
         
         const oldName = tournamentState.details.name;
-
-        // Reset all tournament state
+        // Reset state
         tournamentState.isActive = false;
         tournamentState.channelId = null;
         tournamentState.messageId = null;
@@ -956,79 +642,66 @@ client.on('interactionCreate', async interaction => {
         tournamentState.details = {};
         tournamentState.bracket = [];
 
-        // Try to update the post to reflect the cancellation
         await updateTournamentPost(); 
 
         return interaction.reply({ content: `✅ The tournament **${oldName}** has been successfully ended and all state has been reset.`, ephemeral: false });
     }
 
     if (interaction.commandName === 'updatewinner') {
-        if (!isAdmin) {
-             return interaction.reply({ content: 'You need Administrator permission to update the winner.', ephemeral: true });
-        }
-        if (!tournamentState.isActive) {
-            return interaction.reply({ content: 'No active tournament to update.', ephemeral: true });
-        }
-        if (tournamentState.participants.length < 2 || tournamentState.bracket.length === 0) {
-            return interaction.reply({ content: 'Tournament has not started, or there are not enough participants.', ephemeral: true });
+        if (!isAdmin || !tournamentState.isActive || tournamentState.participants.length < 2 || tournamentState.bracket.length === 0) {
+            return interaction.reply({ content: 'Admin permissions are required, and the tournament must be active with pairings started.', ephemeral: true });
         }
         
         const winner = interaction.options.getUser('winner');
         const winnerUsername = winner.username;
         
-        // --- ADVANCEMENT LOGIC ---
         let matchFound = false;
-        let advancedToNextRound = false;
 
-        // Find the match the winner was in
+        // Find the match the winner was in and update it
         for (const match of tournamentState.bracket) {
             if (!match.winner && (match.p1 === winnerUsername || match.p2 === winnerUsername)) {
                 match.winner = winnerUsername;
                 matchFound = true;
-                advancedToNextRound = true;
                 
-                let replyContent = '';
-                // Handle BYE match
-                if (match.p1 === 'BYE' || match.p2 === 'BYE') {
-                     replyContent = `**${winnerUsername}** automatically advanced due to a BYE.`;
-                } else {
-                     replyContent = `**${winnerUsername}** has won the match and advanced! Updating bracket...`;
-                }
+                let opponent = match.p1 === winnerUsername ? match.p2 : match.p1;
                 
-                await interaction.reply({ content: replyContent, ephemeral: true });
+                await interaction.reply({ content: `**${winnerUsername}** has won against **${opponent}** and advanced!`, ephemeral: true });
                 break;
             }
         }
 
         if (!matchFound) {
-            return interaction.reply({ content: `Could not find an active match for **${winnerUsername}**. Please ensure the match is not already completed.`, ephemeral: true });
+            return interaction.reply({ content: `Could not find an active match for **${winnerUsername}**. They might have already won, or the match is completed.`, ephemeral: true });
         }
         
-        // After a winner is declared, check if the round is complete
-        if (advancedToNextRound) {
-            const allComplete = tournamentState.bracket.every(m => m.winner !== null);
+        // Check if the entire round is complete
+        const allComplete = tournamentState.bracket.every(m => m.winner !== null);
 
-            if (allComplete) {
-                const roundWinners = tournamentState.bracket.map(m => tournamentState.participants.find(p => p.username === m.winner)).filter(p => p !== undefined);
-                
-                if (roundWinners.length === 1) {
-                     // Final winner!
-                     const finalWinner = roundWinners[0].username;
-                     await interaction.followUp({ content: `🎉 **${finalWinner}** has won the entire tournament **${tournamentState.details.name}**! Congratulations!`, ephemeral: false });
-                     
-                     // Keep the final winner in the bracket for display, but mark tournament inactive
-                     tournamentState.bracket = [{ matchId: 1, p1: finalWinner, p2: 'CHAMPION', winner: finalWinner }]; 
-                     tournamentState.isActive = false;
-
-                } else if (roundWinners.length > 1) {
-                    // Start the next round
-                    tournamentState.bracket = generatePairings(roundWinners);
-                    await interaction.followUp({ content: `🏆 Round complete! Starting the next round with ${tournamentState.bracket.length} matches. Check the updated bracket.`, ephemeral: false });
-                }
-            }
+        if (allComplete) {
+            const roundWinners = tournamentState.bracket.map(m => m.winner).filter(w => w !== 'BYE');
             
-            await updateTournamentPost(); 
+            if (roundWinners.length === 1) {
+                 // Final winner!
+                 const finalWinner = roundWinners[0];
+                 await interaction.followUp({ content: `🎉 **${finalWinner}** has won the entire tournament **${tournamentState.details.name}**! Congratulations!`, ephemeral: false });
+                 
+                 // Mark tournament inactive and update final bracket
+                 tournamentState.isActive = false;
+                 tournamentState.bracket = [{ matchId: 1, p1: finalWinner, p2: 'CHAMPION', winner: finalWinner }]; 
+
+            } else if (roundWinners.length > 1) {
+                // Start the next round
+                const nextRoundPlayers = roundWinners.map(username => ({ 
+                    id: tournamentState.participants.find(p => p.username === username)?.id || 'UNKNOWN', 
+                    username: username 
+                }));
+                
+                tournamentState.bracket = generatePairings(nextRoundPlayers);
+                await interaction.followUp({ content: `🏆 Round complete! Starting the next round with ${tournamentState.bracket.length} matches. Check the updated bracket in the announcement channel.`, ephemeral: false });
+            }
         }
+        
+        await updateTournamentPost(); 
     }
 });
 
