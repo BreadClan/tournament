@@ -1,31 +1,38 @@
 // index.js - Complete Tournament Bot Application for Cloud Hosting (Render/Vercel/etc.)
 
 // --- Imports ---
-const { Client, GatewayIntentBits, Partials, SlashCommandBuilder, EmbedBuilder, ChannelType } = require('discord.js');
+const { 
+    Client, GatewayIntentBits, Partials, SlashCommandBuilder, EmbedBuilder, ChannelType, 
+    PermissionsBitField 
+} = require('discord.js');
 const express = require('express');
 const bodyParser = require('body-parser');
-const { createCanvas, loadImage } = require('@napi-rs/canvas'); 
+// Requires the '@napi-rs/canvas' package for image generation
+const { createCanvas } = require('@napi-rs/canvas'); 
 
 // --- Configuration & Initialization ---
 
-// Read environment variables (MUST be set in your Render dashboard)
+// Read environment variables (MUST be set in your hosting environment)
 const TOKEN = process.env.DISCORD_TOKEN; 
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 
-// 1. DYNAMIC PORT: Use the port provided by the hosting environment (process.env.PORT) 
+// 1. DYNAMIC PORT: Use the port provided by the hosting environment
 const PORT = process.env.PORT || 3000; 
 
-// 2. DYNAMIC PUBLIC URL: Use the external web address.
-// IMPORTANT: The environment variable PUBLIC_URL takes precedence. If not set, we use your specific Render URL.
+// 2. DYNAMIC PUBLIC URL: This is the critical URL that must be registered in Discord's Developer Portal.
+// The hardcoded RENDER_HOST_URL is used as a fallback if PUBLIC_URL isn't set, ensuring it points to the correct domain.
 const RENDER_HOST_URL = 'https://bread-tournament-bot.onrender.com';
 const PUBLIC_URL = process.env.PUBLIC_URL || RENDER_HOST_URL || `http://localhost:${PORT}`;
 
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
-// The REDIRECT_URI is now constructed using the PUBLIC_URL
+// Standard Redirect URI for the Tournament Management Form
 const REDIRECT_URI = `${PUBLIC_URL}/discord/callback`; 
+// Invite-specific Redirect URI (MUST be registered in Discord's Developer Portal)
+const INVITE_REDIRECT_URI = `${PUBLIC_URL}/discord/callback-invite`;
+
 const SCOPES = 'identify guilds'; // We need 'guilds' to see which servers the user is in
-const BOT_PERMISSIONS = '8'; // Administrator
+const BOT_PERMISSIONS = '8'; // Administrator (for simplicity in this example)
 
 const client = new Client({ 
     intents: [
@@ -59,6 +66,11 @@ const tournamentState = {
  * @returns {Array<{p1: string, p2: string, matchId: number, winner: string | null}>}
  */
 function generatePairings(players) {
+    // Check for array validity
+    if (!players || players.length < 2) {
+        return [];
+    }
+    
     const shuffledPlayers = [...players].sort(() => 0.5 - Math.random());
     
     let nextPowerOfTwo = 1;
@@ -67,10 +79,12 @@ function generatePairings(players) {
     }
     const padding = nextPowerOfTwo - shuffledPlayers.length;
     for (let i = 0; i < padding; i++) {
+        // Use a placeholder object for BYE
         shuffledPlayers.push({ id: 'BYE', username: 'BYE' });
     }
 
     const pairings = [];
+    // Standard randomized single-elim bracket seed (1 vs N, 2 vs N-1, etc.)
     for (let i = 0; i < shuffledPlayers.length / 2; i++) {
         pairings.push({
             matchId: i + 1,
@@ -85,14 +99,21 @@ function generatePairings(players) {
 
 /**
  * Draws the tournament bracket using the canvas library.
- * [Bracket drawing logic remains unchanged]
+ * @param {Array<Object>} pairings - The current round's match list.
+ * @returns {Buffer} PNG image buffer.
  */
 async function drawTournamentBracket(pairings) {
     const WIDTH = 800;
     const HEIGHT = 600;
-    const canvas = createCanvas(WIDTH, HEIGHT);
-    const ctx = canvas.getContext('2d');
+    // Calculate required height dynamically based on the number of matches
     const BOX_HEIGHT = 40;
+    const MATCH_SPACING = 10;
+    const totalMatchHeight = pairings.length * (BOX_HEIGHT * 2 + MATCH_SPACING);
+    const requiredHeight = Math.max(HEIGHT, totalMatchHeight + 80); 
+
+    const canvas = createCanvas(WIDTH, requiredHeight);
+    const ctx = canvas.getContext('2d');
+    
     const BOX_WIDTH = 180;
     const FONT_SIZE = 16;
     const LINE_COLOR = '#6366f1'; 
@@ -100,7 +121,7 @@ async function drawTournamentBracket(pairings) {
     const WINNER_COLOR = '#4ade80'; 
 
     ctx.fillStyle = '#111827'; 
-    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.fillRect(0, 0, WIDTH, requiredHeight); // Fill background
     
     ctx.font = `${FONT_SIZE}px sans-serif`;
     ctx.fillStyle = TEXT_COLOR;
@@ -113,7 +134,7 @@ async function drawTournamentBracket(pairings) {
 
     // Draw Matches
     pairings.forEach((match, index) => {
-        const y = startY + index * (BOX_HEIGHT * 2 + 10);
+        const y = startY + index * (BOX_HEIGHT * 2 + MATCH_SPACING);
         
         ctx.strokeStyle = LINE_COLOR;
         ctx.lineWidth = 2;
@@ -160,16 +181,17 @@ async function drawTournamentBracket(pairings) {
 
 /**
  * Updates the Discord message with the latest participants and bracket image.
- * [Update post logic remains unchanged]
  */
 async function updateTournamentPost() {
     if (!tournamentState.messageId || !tournamentState.channelId) return;
 
     try {
         const channel = await client.channels.fetch(tournamentState.channelId);
+        if (!channel) return;
         const message = await channel.messages.fetch(tournamentState.messageId);
 
-        if (tournamentState.bracket.length === 0 && tournamentState.participants.length > 1) {
+        // Only generate pairings if the tournament is active and has participants, but no bracket yet.
+        if (tournamentState.bracket.length === 0 && tournamentState.participants.length > 1 && tournamentState.isActive) {
             tournamentState.bracket = generatePairings(tournamentState.participants);
         }
         
@@ -181,13 +203,13 @@ async function updateTournamentPost() {
         
         const newEmbed = new EmbedBuilder()
             .setTitle(`🏆 ${tournamentState.details.name}`)
-            .setDescription(`React with ✅ below to join! Current participants:`)
+            .setDescription(tournamentState.isActive ? `React with ✅ below to join! Current participants:` : 'This tournament has concluded or been cancelled.')
             .addFields(
                 { name: 'Prize', value: tournamentState.details.prize, inline: true },
                 { name: 'Entry Fee', value: tournamentState.details.entryFee || 'Free', inline: true },
                 { name: `Participants (${tournamentState.participants.length})`, value: participantList.substring(0, 1024), inline: false }
             )
-            .setColor(0x6366f1) 
+            .setColor(tournamentState.isActive ? 0x6366f1 : 0xef4444) // Purple when active, Red when ended
             .setImage('attachment://tournament-bracket.png'); 
             
         await message.edit({ 
@@ -205,7 +227,7 @@ async function updateTournamentPost() {
 
 /**
  * Generates the HTML based on whether the user is logged in, or if custom content is provided.
- * * @param {Array<Object> | null} filteredGuilds - List of guilds the user is in AND the bot is in (for management form).
+ * @param {Array<Object> | null} filteredGuilds - List of guilds the user is in AND the bot is in.
  * @param {string | null} customContent - HTML to display instead of the form or login prompt.
  * @returns {string} The full HTML content.
  */
@@ -227,6 +249,13 @@ function getWebpageHtml(filteredGuilds = null, customContent = null) {
 
     // --- 2. The main form content ---
     const setupForm = `
+        ${tournamentState.isActive ? `
+            <div class="message-box error">
+                <h2>Tournament Active!</h2>
+                <p>A tournament is currently active in Discord. Please use the **/endtournament** command on your server to reset the state and launch a new one.</p>
+            </div>
+        ` : ''}
+
         <p>Define the parameters to launch the tournament registration on Discord.</p>
         <form action="/start-tournament" method="POST">
             <label for="name">Tournament Name</label>
@@ -239,16 +268,16 @@ function getWebpageHtml(filteredGuilds = null, customContent = null) {
             <input type="text" id="entryFee" name="entryFee" placeholder="e.g., Free, 5,000 Gold, or None">
 
             <label for="guildId">Target Discord Server</label>
-            <select id="guildId" name="guildId" required ${formDisabled}>
+            <select id="guildId" name="guildId" required ${formDisabled} ${tournamentState.isActive ? 'disabled' : ''}>
                 ${guildOptions}
             </select>
             
             <label for="channelId">Target Discord Channel</label>
-            <select id="channelId" name="channelId" required disabled>
+            <select id="channelId" name="channelId" required disabled ${tournamentState.isActive ? 'disabled' : ''}>
                 <option value="" disabled selected>Select a Server First</option>
             </select>
             
-            <button type="submit" ${formDisabled ? 'disabled' : ''}>🚀 Launch Registration Event</button>
+            <button type="submit" ${formDisabled || tournamentState.isActive ? 'disabled' : ''}>🚀 Launch Registration Event</button>
         </form>
         <hr style="border-top: 1px solid var(--border-color); margin: 30px 0;">
         <p style="margin-bottom: 0;">Is your server missing? <a href="/discord/invite" style="color: var(--success-color); font-weight: 600;">Invite the bot here</a>.</p>
@@ -374,12 +403,17 @@ function getWebpageHtml(filteredGuilds = null, customContent = null) {
                 margin-top: 10px;
             }
 
-            button:hover {
+            button:hover:not(:disabled) {
                 background-color: #4f46e5;
             }
             
-            button:active {
+            button:active:not(:disabled) {
                 transform: scale(0.99);
+            }
+            
+            button:disabled {
+                background-color: #4b5563;
+                cursor: not-allowed;
             }
 
             /* Guild List Specific Styles */
@@ -417,7 +451,7 @@ function getWebpageHtml(filteredGuilds = null, customContent = null) {
             .message-box {
                 padding: 1.5rem;
                 border-radius: 0.5rem;
-                margin-top: 20px;
+                margin-bottom: 20px;
                 text-align: center;
             }
             .message-box.success {
@@ -456,6 +490,10 @@ function getWebpageHtml(filteredGuilds = null, customContent = null) {
                     const guildId = e.target.value;
                     channelSelect.innerHTML = '<option value="" disabled selected>Loading Channels...</option>';
                     channelSelect.disabled = true;
+                    // Disable the submit button until a channel is selected
+                    const submitButton = document.querySelector('button[type="submit"]');
+                    if (submitButton) submitButton.disabled = true;
+
 
                     if (!guildId) return;
 
@@ -468,6 +506,7 @@ function getWebpageHtml(filteredGuilds = null, customContent = null) {
                         
                         if (channels.length === 0) {
                             channelSelect.innerHTML = '<option value="" disabled selected>No Text Channels found</option>';
+                            channelSelect.disabled = true;
                         } else {
                             channels.forEach(channel => {
                                 const option = document.createElement('option');
@@ -481,6 +520,18 @@ function getWebpageHtml(filteredGuilds = null, customContent = null) {
                     } catch (error) {
                         console.error('Error fetching channels:', error);
                         channelSelect.innerHTML = '<option value="" disabled selected>Error loading channels</option>';
+                        channelSelect.disabled = true;
+                    }
+                });
+
+                // 2. Enable submit button once a channel is selected (if not already disabled by active tournament)
+                 channelSelect.addEventListener('change', () => {
+                    const submitButton = document.querySelector('button[type="submit"]');
+                    if (submitButton && channelSelect.value !== "") {
+                        // Check if the form is generally disabled (e.g., if a tournament is active)
+                        if (!submitButton.hasAttribute('disabled')) {
+                            submitButton.disabled = false;
+                        }
                     }
                 });
             });
@@ -498,27 +549,29 @@ function getWebpageHtml(filteredGuilds = null, customContent = null) {
 
 /**
  * Generates the HTML to list invitable guilds (Only used for the explicit /invite route).
- * [Invite logic remains mostly unchanged]
+ * @param {Array<Object>} guilds - List of guilds the user is in.
+ * @returns {string} HTML content for the invite page.
  */
 function getGuildListHtml(guilds) {
     // Filter for guilds where the user has Administrator permissions (BigInt 0x8)
     const invitableGuilds = guilds.filter(guild => {
-        const permission = BigInt(guild.permissions);
-        const administrator = BigInt(0x8);
-        return (permission & administrator) === administrator;
+        // Use PermissionsBitField to check for Administrator
+        const permission = new PermissionsBitField(BigInt(guild.permissions));
+        return permission.has(PermissionsBitField.Flags.Administrator);
     });
 
     if (invitableGuilds.length === 0) {
         return `
             <div class="message-box error">
-                <h2>No Servers Found</h2>
-                <p>You do not have Administrator permissions in any server to invite the bot.</p>
+                <h2>No Admin Servers Found</h2>
+                <p>You must have Administrator permissions in a server to invite the bot.</p>
             </div>
-            <a href="/" style="text-decoration: none;"><button>Return to Login</button></a>
+            <a href="/" style="text-decoration: none;"><button>Return to Manager</button></a>
         `;
     }
 
     const guildItems = invitableGuilds.map(guild => {
+        // Ensure the correct BOT_PERMISSIONS are used in the invite URL
         const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&permissions=${BOT_PERMISSIONS}&scope=bot&guild_id=${guild.id}`;
         return `
             <li class="guild-item">
@@ -550,25 +603,26 @@ app.get('/', (req, res) => {
         // If no user information is available, show the login prompt (filteredGuilds = null)
         res.send(getWebpageHtml(null));
     } else {
-        res.status(503).send('<body style="background: var(--bg-color); color: var(--text-color); font-family: \'Inter\', sans-serif;">Bot not ready. Please wait a moment and refresh.</body>');
+        res.status(503).send('<body style="background: #0c0c0c; color: #f3f4f6; font-family: \'Inter\', sans-serif; text-align: center; padding-top: 50px;">Bot not ready. Please wait a moment and refresh.</body>');
     }
 });
 
 // Explicit invite link (requires login, but uses a different redirect)
 app.get('/discord/invite', (req, res) => {
     if (!CLIENT_ID) {
-        return res.status(500).send('<body style="background: black; color: white;">CLIENT_ID not set.</body>');
+        return res.status(500).send('<body style="background: #0c0c0c; color: #ef4444;">CLIENT_ID not set.</body>');
     }
-    const url = `${DISCORD_API_BASE}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(`${PUBLIC_URL}/discord/callback-invite`)}&scope=${encodeURIComponent(SCOPES)}`;
+    // Uses the INVITE_REDIRECT_URI which is the one you were troubleshooting
+    const url = `${DISCORD_API_BASE}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(INVITE_REDIRECT_URI)}&scope=${encodeURIComponent(SCOPES)}`;
     res.redirect(url);
 });
 
 // Route 1: Redirects user to Discord's authorization page (Standard login for management form)
 app.get('/discord/login', (req, res) => {
     if (!CLIENT_ID) {
-        return res.status(500).send('<body style="background: black; color: white;">CLIENT_ID not set. Cannot proceed with OAuth.</body>');
+        return res.status(500).send('<body style="background: #0c0c0c; color: #ef4444;">CLIENT_ID not set. Cannot proceed with OAuth.</body>');
     }
-    // Uses the standard REDIRECT_URI to return to the server-side logic
+    // Uses the standard REDIRECT_URI
     const url = `${DISCORD_API_BASE}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=${encodeURIComponent(SCOPES)}`;
     res.redirect(url);
 });
@@ -623,7 +677,7 @@ app.get('/discord/callback', async (req, res) => {
                 client_secret: CLIENT_SECRET,
                 grant_type: 'authorization_code',
                 code: code,
-                redirect_uri: REDIRECT_URI, // Uses the dynamic REDIRECT_URI
+                redirect_uri: REDIRECT_URI, 
                 scope: SCOPES,
             }),
         });
@@ -649,22 +703,29 @@ app.get('/discord/callback', async (req, res) => {
         // --- FILTERING LOGIC: Find intersection of User's guilds and Bot's guilds ---
         const botGuildIds = client.guilds.cache.map(guild => guild.id);
         
+        // Filter for guilds the bot is in AND the user has administrative permissions in
         const filteredGuilds = userGuilds
             .filter(userGuild => botGuildIds.includes(userGuild.id))
-            .map(g => ({ id: g.id, name: g.name })); // Keep only necessary data
+            .filter(userGuild => new PermissionsBitField(BigInt(userGuild.permissions)).has(PermissionsBitField.Flags.Administrator))
+            .map(g => ({ id: g.id, name: g.name }));
 
         // Render the main page, passing the filtered list directly
         res.send(getWebpageHtml(filteredGuilds));
 
     } catch (error) {
         console.error('OAuth Flow Error (Management):', error);
-        res.status(500).send(getWebpageHtml(null)); // Redirect back to login prompt on error
+        res.status(500).send(`
+            <body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif; text-align: center; padding-top: 50px;">
+                <h2>Login Error</h2>
+                <p>An error occurred during Discord login. Ensure the Redirect URI: <strong>${REDIRECT_URI}</strong> is registered in your Discord Developer Portal.</p>
+                <a href="/" style="color: #4ade80;">Try Logging In Again</a>
+            </body>
+        `); 
     }
 });
 
 
 // Route 2B: Receives the authorization code and exchanges it for an access token (for the invite flow)
-// FIX: The rendering logic now correctly uses the customContent parameter in getWebpageHtml.
 app.get('/discord/callback-invite', async (req, res) => {
     const { code } = req.query;
 
@@ -682,8 +743,7 @@ app.get('/discord/callback-invite', async (req, res) => {
                 client_secret: CLIENT_SECRET,
                 grant_type: 'authorization_code',
                 code: code,
-                // IMPORTANT: This URI must be registered in the Discord Developer Portal
-                redirect_uri: `${PUBLIC_URL}/discord/callback-invite`, 
+                redirect_uri: INVITE_REDIRECT_URI, // Uses the specific INVITE_REDIRECT_URI
                 scope: SCOPES,
             }),
         });
@@ -706,19 +766,17 @@ app.get('/discord/callback-invite', async (req, res) => {
             throw new Error('Failed to retrieve user guilds.');
         }
 
-        // Render the list of invitable guilds using the new custom content parameter
+        // Render the list of invitable guilds using the custom content parameter
         res.send(getWebpageHtml(null, getGuildListHtml(guilds)));
 
     } catch (error) {
         console.error('OAuth Flow Error (Invite):', error);
-        // If the error is an OAuth error, it often means the redirect URI is bad.
+        // Provide clear feedback on potential redirect URI mismatch
         res.status(500).send(`
-            <body style="background: var(--bg-color); color: var(--text-color); font-family: 'Inter', sans-serif;">
-                <div class="card-container" style="max-width: 500px; margin: auto; padding: 2rem; background: #1f1f1f; border-radius: 0.5rem; color: #f3f4f6; text-align: center;">
-                    <h2>OAuth Error</h2>
-                    <p>There was an error logging you in. This usually means the **redirect URI** in the Discord Developer Portal is incorrect or missing the path: <strong>/discord/callback-invite</strong>.</p>
-                    <a href="/" style="color: #4ade80; text-decoration: none; font-weight: 600;">Return to Login</a>
-                </div>
+            <body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif; text-align: center; padding-top: 50px;">
+                <h2>Invite Error</h2>
+                <p>An error occurred during the invite process. Ensure the Redirect URI: <strong>${INVITE_REDIRECT_URI}</strong> is registered in your Discord Developer Portal.</p>
+                <a href="/discord/invite" style="color: #4ade80;">Try Inviting Again</a>
             </body>
         `);
     }
@@ -728,14 +786,13 @@ app.get('/discord/callback-invite', async (req, res) => {
 // POST route: Handles the form submission to start the tournament
 app.post('/start-tournament', async (req, res) => {
     if (tournamentState.isActive) {
+        // This should be blocked by the HTML form, but is here for server-side validation
         return res.status(400).send(`
-            <body style="background: var(--bg-color); color: var(--text-color); font-family: 'Inter', sans-serif;">
-                <div class="card-container">
-                    <div class="message-box error">
-                        <h2>Error!</h2>
-                        <p>A tournament is already active in <#${tournamentState.channelId}>. Please use Discord commands to end it first.</p>
-                        <a href="/">Go Back</a>
-                    </div>
+            <body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif; text-align: center; padding-top: 50px;">
+                <div style="background: #1f1f1f; padding: 2rem; border-radius: 0.5rem; border: 1px solid #ef4444;">
+                    <h2>Error!</h2>
+                    <p>A tournament is already active. Please use the **/endtournament** command in Discord first.</p>
+                    <a href="/" style="color: #4ade80;">Go Back</a>
                 </div>
             </body>
         `);
@@ -744,7 +801,7 @@ app.post('/start-tournament', async (req, res) => {
     const { name, prize, guildId, channelId, entryFee } = req.body;
     
     if (!name || !prize || !guildId || !channelId) {
-        return res.status(400).send('<body style="background: black; color: white;">Missing required details.</body>');
+        return res.status(400).send('<body style="background: #0c0c0c; color: #f3f4f6;">Missing required details.</body>');
     }
     
     let htmlResponse;
@@ -788,7 +845,7 @@ app.post('/start-tournament', async (req, res) => {
             <div class="message-box success">
                 <h2>Success!</h2>
                 <p>Tournament **${name}** launched in Discord server **${channel.guild.name}**, channel <a href="https://discord.com/channels/${channel.guildId}/${channelId}" target="_blank">#${channel.name}</a>.</p>
-                <p>Registrations are now open.</p>
+                <p>Registrations are now open. Use **/updatewinner** to manage matches.</p>
                 <a href="/">Go Back to Manager</a>
             </div>
         `;
@@ -807,7 +864,7 @@ app.post('/start-tournament', async (req, res) => {
     
     // Render the response page with the success/error message
     res.send(`
-        <body style="background: var(--bg-color); color: var(--text-color); font-family: 'Inter', sans-serif;">
+        <body style="background: #0c0c0c; color: #f3f4f6; font-family: 'Inter', sans-serif;">
             <style>
                 :root {--bg-color: #0c0c0c;--card-color: #1f1f1f;--text-color: #f3f4f6;--input-bg: #2d2d2d;--border-color: #3f3f3f;--accent-color: #6366f1;--success-color: #4ade80;--error-color: #ef4444;}
                 body {background-color: var(--bg-color);color: var(--text-color);font-family: 'Inter', sans-serif;margin: 0;min-height: 100vh;display: flex;align-items: center;justify-content: center;padding: 20px;}
@@ -830,7 +887,7 @@ app.post('/start-tournament', async (req, res) => {
 client.on('ready', () => {
     console.log(`Bot is logged in as ${client.user.tag}!`);
     
-    // Register the slash command
+    // Define and Register Slash Commands
     const updateWinnerCommand = new SlashCommandBuilder()
         .setName('updatewinner')
         .setDescription('Advances the specified user to the next round of the active tournament.')
@@ -839,7 +896,15 @@ client.on('ready', () => {
                 .setDescription('The user who won the match to be advanced.')
                 .setRequired(true));
 
-    client.application.commands.create(updateWinnerCommand.toJSON());
+    const endTournamentCommand = new SlashCommandBuilder()
+        .setName('endtournament')
+        .setDescription('Ends the current active tournament immediately (Admin only).');
+
+    // Register commands globally or guild-specific
+    client.application.commands.set([
+        updateWinnerCommand.toJSON(),
+        endTournamentCommand.toJSON()
+    ]);
 });
 
 // Handler for the Reaction Sign-up
@@ -848,69 +913,122 @@ client.on('messageReactionAdd', async (reaction, user) => {
     if (user.bot || reaction.message.id !== tournamentState.messageId || reaction.emoji.name !== '✅') return;
     if (!tournamentState.isActive) return;
 
-    // Fetch the full user details if not cached (needed for username)
-    const fetchedUser = await client.users.fetch(user.id);
+    try {
+        // Fetch the full user details if not cached (needed for username)
+        const fetchedUser = await client.users.fetch(user.id);
 
-    // Check if user is already in the list
-    if (!tournamentState.participants.some(p => p.id === fetchedUser.id)) {
-        tournamentState.participants.push({ id: fetchedUser.id, username: fetchedUser.username });
-        console.log(`${fetchedUser.username} joined the tournament.`);
-        // Update the post for "live" effect
-        await updateTournamentPost();
+        // Check if user is already in the list
+        if (!tournamentState.participants.some(p => p.id === fetchedUser.id)) {
+            tournamentState.participants.push({ id: fetchedUser.id, username: fetchedUser.username });
+            console.log(`${fetchedUser.username} joined the tournament.`);
+            // Update the post for "live" effect
+            await updateTournamentPost();
+        }
+    } catch (e) {
+        console.error("Error processing reaction:", e);
     }
 });
 
-// Handler for the /updatewinner command
+// Handler for Slash Commands
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'updatewinner') return;
-    if (!tournamentState.isActive) {
-        return interaction.reply({ content: 'No active tournament to update.', ephemeral: true });
-    }
 
-    const winner = interaction.options.getUser('winner');
-    const winnerUsername = winner.username;
-    
-    // --- ADVANCEMENT LOGIC ---
-    let matchFound = false;
-    let advancedToNextRound = false;
+    // --- Permissions Check (only needed for management commands) ---
+    const memberPermissions = interaction.member?.permissions;
+    const isAdmin = memberPermissions && memberPermissions.has(PermissionsBitField.Flags.Administrator);
 
-    // Find the match the winner was in
-    for (const match of tournamentState.bracket) {
-        if (!match.winner && (match.p1 === winnerUsername || match.p2 === winnerUsername)) {
-            match.winner = winnerUsername;
-            matchFound = true;
-            advancedToNextRound = true;
-            
-            // Handle BYE match
-            if (match.p1 === 'BYE' || match.p2 === 'BYE') {
-                 await interaction.reply({ content: `**${winnerUsername}** automatically advanced due to a BYE.`, ephemeral: true });
-            } else {
-                 await interaction.reply({ content: `**${winnerUsername}** has won their match and advanced! Updating bracket...`, ephemeral: true });
-            }
-            break;
+    if (interaction.commandName === 'endtournament') {
+        if (!isAdmin) {
+            return interaction.reply({ content: 'You need Administrator permission to end the tournament.', ephemeral: true });
         }
-    }
 
-    if (!matchFound) {
-        return interaction.reply({ content: `Could not find an active match for **${winnerUsername}**. Have they already advanced?`, ephemeral: true });
-    }
-    
-    // After a winner is declared, update the pairings structure (simplified for example)
-    if (advancedToNextRound) {
-        const allComplete = tournamentState.bracket.every(m => m.winner !== null);
-        if (allComplete && tournamentState.bracket.length > 1) {
-            const winners = tournamentState.bracket.map(m => tournamentState.participants.find(p => p.username === m.winner)).filter(p => p !== undefined);
-            tournamentState.bracket = generatePairings(winners);
-            if (tournamentState.bracket.length === 1) {
-                 // Final winner!
-                 const finalWinner = tournamentState.bracket[0].p1;
-                 await interaction.followUp({ content: `🎉 **${finalWinner}** has won the entire tournament! Congratulations!`, ephemeral: false });
-                 tournamentState.isActive = false;
-            }
+        if (!tournamentState.isActive) {
+            return interaction.reply({ content: 'There is no active tournament to end.', ephemeral: true });
         }
         
+        const oldName = tournamentState.details.name;
+
+        // Reset all tournament state
+        tournamentState.isActive = false;
+        tournamentState.channelId = null;
+        tournamentState.messageId = null;
+        tournamentState.participants = [];
+        tournamentState.details = {};
+        tournamentState.bracket = [];
+
+        // Try to update the post to reflect the cancellation
         await updateTournamentPost(); 
+
+        return interaction.reply({ content: `✅ The tournament **${oldName}** has been successfully ended and all state has been reset.`, ephemeral: false });
+    }
+
+    if (interaction.commandName === 'updatewinner') {
+        if (!isAdmin) {
+             return interaction.reply({ content: 'You need Administrator permission to update the winner.', ephemeral: true });
+        }
+        if (!tournamentState.isActive) {
+            return interaction.reply({ content: 'No active tournament to update.', ephemeral: true });
+        }
+        if (tournamentState.participants.length < 2 || tournamentState.bracket.length === 0) {
+            return interaction.reply({ content: 'Tournament has not started, or there are not enough participants.', ephemeral: true });
+        }
+        
+        const winner = interaction.options.getUser('winner');
+        const winnerUsername = winner.username;
+        
+        // --- ADVANCEMENT LOGIC ---
+        let matchFound = false;
+        let advancedToNextRound = false;
+
+        // Find the match the winner was in
+        for (const match of tournamentState.bracket) {
+            if (!match.winner && (match.p1 === winnerUsername || match.p2 === winnerUsername)) {
+                match.winner = winnerUsername;
+                matchFound = true;
+                advancedToNextRound = true;
+                
+                let replyContent = '';
+                // Handle BYE match
+                if (match.p1 === 'BYE' || match.p2 === 'BYE') {
+                     replyContent = `**${winnerUsername}** automatically advanced due to a BYE.`;
+                } else {
+                     replyContent = `**${winnerUsername}** has won the match and advanced! Updating bracket...`;
+                }
+                
+                await interaction.reply({ content: replyContent, ephemeral: true });
+                break;
+            }
+        }
+
+        if (!matchFound) {
+            return interaction.reply({ content: `Could not find an active match for **${winnerUsername}**. Please ensure the match is not already completed.`, ephemeral: true });
+        }
+        
+        // After a winner is declared, check if the round is complete
+        if (advancedToNextRound) {
+            const allComplete = tournamentState.bracket.every(m => m.winner !== null);
+
+            if (allComplete) {
+                const roundWinners = tournamentState.bracket.map(m => tournamentState.participants.find(p => p.username === m.winner)).filter(p => p !== undefined);
+                
+                if (roundWinners.length === 1) {
+                     // Final winner!
+                     const finalWinner = roundWinners[0].username;
+                     await interaction.followUp({ content: `🎉 **${finalWinner}** has won the entire tournament **${tournamentState.details.name}**! Congratulations!`, ephemeral: false });
+                     
+                     // Keep the final winner in the bracket for display, but mark tournament inactive
+                     tournamentState.bracket = [{ matchId: 1, p1: finalWinner, p2: 'CHAMPION', winner: finalWinner }]; 
+                     tournamentState.isActive = false;
+
+                } else if (roundWinners.length > 1) {
+                    // Start the next round
+                    tournamentState.bracket = generatePairings(roundWinners);
+                    await interaction.followUp({ content: `🏆 Round complete! Starting the next round with ${tournamentState.bracket.length} matches. Check the updated bracket.`, ephemeral: false });
+                }
+            }
+            
+            await updateTournamentPost(); 
+        }
     }
 });
 
