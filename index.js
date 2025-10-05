@@ -1,25 +1,31 @@
-// index.js - Complete Tournament Bot Application
+// index.js - Complete Tournament Bot Application for Cloud Hosting (Render/Vercel/etc.)
 
 // --- Imports ---
 const { Client, GatewayIntentBits, Partials, SlashCommandBuilder, EmbedBuilder, ChannelType } = require('discord.js');
 const express = require('express');
 const bodyParser = require('body-parser');
-// NOTE: Replaced 'canvas' with '@napi-rs/canvas' for improved performance.
 const { createCanvas, loadImage } = require('@napi-rs/canvas'); 
-// NOTE: We assume a modern Node.js environment with global fetch. 
 
 // --- Configuration & Initialization ---
+
+// Read environment variables (MUST be set in your Render dashboard)
 const TOKEN = process.env.DISCORD_TOKEN; 
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
-// CRITICAL FIX: Use the port provided by the hosting environment (process.env.PORT) 
-// and fall back to 3000 for local testing.
+
+// 1. DYNAMIC PORT: Use the port provided by the hosting environment (process.env.PORT) 
 const PORT = process.env.PORT || 3000; 
+
+// 2. DYNAMIC PUBLIC URL: Use the external web address.
+// IMPORTANT: The environment variable PUBLIC_URL takes precedence. If not set, we use your specific Render URL.
+const RENDER_HOST_URL = 'https://bread-tournament-bot.onrender.com';
+const PUBLIC_URL = process.env.PUBLIC_URL || RENDER_HOST_URL || `http://localhost:${PORT}`;
+
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
-// NOTE: REDIRECT_URI is now only needed for the "Invite Bot" OAuth flow
-const REDIRECT_URI = 'http://localhost:3000/discord/callback'; 
+// The REDIRECT_URI is now constructed using the PUBLIC_URL
+const REDIRECT_URI = `${PUBLIC_URL}/discord/callback`; 
 const SCOPES = 'identify guilds';
-const BOT_PERMISSIONS = '8'; // Administrator (or specific permissions like 268435456 for Manage Guild)
+const BOT_PERMISSIONS = '8'; // Administrator
 
 const client = new Client({ 
     intents: [
@@ -38,7 +44,7 @@ const tournamentState = {
     isActive: false,
     channelId: null,
     messageId: null,
-    // Participants stored as { id: 'userID', username: 'username', status: 'R1' }
+    // Participants stored as { id: 'userID', username: 'username' }
     participants: [], 
     details: {},
     bracket: [] // Structured array for pairings and advancement
@@ -48,15 +54,13 @@ const tournamentState = {
 
 /**
  * Generates initial pairings for a single-elimination tournament.
- * Uses a simple bracket structure for demonstration.
+ * Pads with 'BYE' if player count is not a power of 2.
  * @param {Array<{id: string, username: string}>} players 
  * @returns {Array<{p1: string, p2: string, matchId: number, winner: string | null}>}
  */
 function generatePairings(players) {
-    // Clone and shuffle players for fair initial pairing
     const shuffledPlayers = [...players].sort(() => 0.5 - Math.random());
     
-    // Pad with 'BYE' if count is not a power of 2
     let nextPowerOfTwo = 1;
     while (nextPowerOfTwo < shuffledPlayers.length) {
         nextPowerOfTwo *= 2;
@@ -85,7 +89,6 @@ function generatePairings(players) {
  * @returns {Promise<Buffer>} - A promise that resolves to a PNG image buffer.
  */
 async function drawTournamentBracket(pairings) {
-    // Constants for drawing (no change, keeping the existing drawing logic)
     const WIDTH = 800;
     const HEIGHT = 600;
     const canvas = createCanvas(WIDTH, HEIGHT);
@@ -97,16 +100,13 @@ async function drawTournamentBracket(pairings) {
     const TEXT_COLOR = '#f3f4f6';
     const WINNER_COLOR = '#4ade80'; 
 
-    // Background
     ctx.fillStyle = '#111827'; 
     ctx.fillRect(0, 0, WIDTH, HEIGHT);
     
-    // Setup Font
     ctx.font = `${FONT_SIZE}px sans-serif`;
     ctx.fillStyle = TEXT_COLOR;
     ctx.textAlign = 'left';
 
-    // Title
     ctx.fillText('Tournament Bracket - Current Round', 20, 30);
     
     const startY = 60;
@@ -116,7 +116,6 @@ async function drawTournamentBracket(pairings) {
     pairings.forEach((match, index) => {
         const y = startY + index * (BOX_HEIGHT * 2 + 10);
         
-        // Match Box Outline
         ctx.strokeStyle = LINE_COLOR;
         ctx.lineWidth = 2;
         ctx.strokeRect(startX, y, BOX_WIDTH, BOX_HEIGHT * 2);
@@ -142,7 +141,7 @@ async function drawTournamentBracket(pairings) {
         const midY = y + BOX_HEIGHT;
         ctx.beginPath();
         ctx.moveTo(startX + BOX_WIDTH, midY);
-        ctx.lineTo(startX + BOX_WIDTH + 50, midY); // Horizontal connector
+        ctx.lineTo(startX + BOX_WIDTH + 50, midY); 
         ctx.stroke();
 
         // Draw winner placeholder
@@ -154,10 +153,9 @@ async function drawTournamentBracket(pairings) {
              ctx.fillText('WINNER PENDING', startX + BOX_WIDTH + 60, midY + 5);
         }
 
-        ctx.fillStyle = TEXT_COLOR; // Reset color
+        ctx.fillStyle = TEXT_COLOR; 
     });
 
-    // The toBuffer() method is standard across canvas implementations
     return canvas.toBuffer('image/png');
 }
 
@@ -171,20 +169,16 @@ async function updateTournamentPost() {
         const channel = await client.channels.fetch(tournamentState.channelId);
         const message = await channel.messages.fetch(tournamentState.messageId);
 
-        // If the bracket is empty, generate initial pairings from participants
         if (tournamentState.bracket.length === 0 && tournamentState.participants.length > 1) {
             tournamentState.bracket = generatePairings(tournamentState.participants);
         }
         
-        // Generate the Bracket Image
         const imageBuffer = await drawTournamentBracket(tournamentState.bracket);
         
-        // Prepare the list of participants for the embed
         const participantList = tournamentState.participants.length > 0 
             ? tournamentState.participants.map(p => `• ${p.username}`).join('\n') 
             : 'No one has joined yet.';
         
-        // Create the new embed
         const newEmbed = new EmbedBuilder()
             .setTitle(`🏆 ${tournamentState.details.name}`)
             .setDescription(`React with ✅ below to join! Current participants:`)
@@ -193,10 +187,9 @@ async function updateTournamentPost() {
                 { name: 'Entry Fee', value: tournamentState.details.entryFee || 'Free', inline: true },
                 { name: `Participants (${tournamentState.participants.length})`, value: participantList.substring(0, 1024), inline: false }
             )
-            .setColor(0x6366f1) // Accent color
-            .setImage('attachment://tournament-bracket.png'); // Reference the attached image
+            .setColor(0x6366f1) 
+            .setImage('attachment://tournament-bracket.png'); 
             
-        // Edit the message with the new embed and the generated image
         await message.edit({ 
             embeds: [newEmbed], 
             files: [{ 
@@ -216,7 +209,6 @@ async function updateTournamentPost() {
  * @returns {string} The full HTML content.
  */
 function getWebpageHtml(loginContent = 'login') {
-    // New default form structure with select elements
     const defaultForm = `
         <p>Define the parameters to launch the tournament registration on Discord.</p>
         <form action="/start-tournament" method="POST">
@@ -362,7 +354,7 @@ function getWebpageHtml(loginContent = 'login') {
                 transform: scale(0.99);
             }
 
-            /* Guild List Specific Styles - Retained for OAuth Success Page */
+            /* Guild List Specific Styles */
             .guild-list {
                 list-style: none;
                 padding: 0;
@@ -387,13 +379,13 @@ function getWebpageHtml(loginContent = 'login') {
                 transition: background-color 0.2s;
             }
             .guild-invite-btn:hover {
-                background-color: #22c55e; /* Tailwind green-500 */
+                background-color: #22c55e;
             }
             .guild-name {
                 font-weight: 600;
             }
 
-            /* Message Styling (unchanged) */
+            /* Message Styling */
             .message-box {
                 padding: 1.5rem;
                 border-radius: 0.5rem;
@@ -435,6 +427,7 @@ function getWebpageHtml(loginContent = 'login') {
                 // 1. Fetch and populate the Server/Guild dropdown
                 const populateGuilds = async () => {
                     try {
+                        // Use relative paths for API endpoints
                         const response = await fetch('/api/guilds');
                         const guilds = await response.json();
 
@@ -492,7 +485,7 @@ function getWebpageHtml(loginContent = 'login') {
                     }
                 });
 
-                // Initialize the guild population after a brief delay to ensure the bot client is ready
+                // Initialize the guild population after a brief delay 
                 setTimeout(populateGuilds, 500);
             });
         </script>
@@ -513,8 +506,8 @@ function getWebpageHtml(loginContent = 'login') {
  * @returns {string} HTML content.
  */
 function getGuildListHtml(guilds) {
+    // Filter for guilds where the user has Administrator permissions (BigInt 0x8)
     const invitableGuilds = guilds.filter(guild => {
-        // Check for Administrator permission (8)
         const permission = BigInt(guild.permissions);
         const administrator = BigInt(0x8);
         return (permission & administrator) === administrator;
@@ -552,12 +545,11 @@ function getGuildListHtml(guilds) {
     `;
 }
 
-// --- EXPRESS SERVER (REPLIT PREVIEW) ---
+// --- EXPRESS SERVER (WEB APP ROUTES) ---
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// GET route: Serves the styled HTML form (or login/guild list)
+// GET route: Serves the styled HTML form 
 app.get('/', (req, res) => {
-    // Ensure the bot is ready before serving the page that relies on its cache
     if (client.isReady()) {
         res.send(getWebpageHtml('login'));
     } else {
@@ -565,7 +557,7 @@ app.get('/', (req, res) => {
     }
 });
 
-// NEW API Endpoint: Get list of guilds the bot is in
+// API Endpoint: Get list of guilds the bot is in
 app.get('/api/guilds', (req, res) => {
     if (!client.isReady()) {
         return res.status(503).json([]);
@@ -579,7 +571,7 @@ app.get('/api/guilds', (req, res) => {
     res.json(guilds);
 });
 
-// NEW API Endpoint: Get text channels for a specific guild
+// API Endpoint: Get text channels for a specific guild
 app.get('/api/channels/:guildId', async (req, res) => {
     if (!client.isReady()) {
         return res.status(503).json([]);
@@ -592,10 +584,10 @@ app.get('/api/channels/:guildId', async (req, res) => {
             return res.status(404).json([]);
         }
 
-        // Fetch all channels, then filter for text channels
         const channels = await guild.channels.fetch();
+        // Filter for text channels (ChannelType.GuildText is 0)
         const textChannels = channels
-            .filter(channel => channel.type === ChannelType.GuildText)
+            .filter(channel => channel.type === ChannelType.GuildText) 
             .map(channel => ({
                 id: channel.id,
                 name: channel.name,
@@ -615,6 +607,7 @@ app.get('/discord/login', (req, res) => {
     if (!CLIENT_ID) {
         return res.status(500).send('<body style="background: black; color: white;">CLIENT_ID not set in environment variables. Cannot proceed with OAuth.</body>');
     }
+    // Uses the dynamic REDIRECT_URI
     const url = `${DISCORD_API_BASE}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=${encodeURIComponent(SCOPES)}`;
     res.redirect(url);
 });
@@ -624,7 +617,6 @@ app.get('/discord/callback', async (req, res) => {
     const { code } = req.query;
 
     if (!code) {
-        // User may have denied access, return to the form
         return res.redirect('/'); 
     }
 
@@ -638,7 +630,7 @@ app.get('/discord/callback', async (req, res) => {
                 client_secret: CLIENT_SECRET,
                 grant_type: 'authorization_code',
                 code: code,
-                redirect_uri: REDIRECT_URI,
+                redirect_uri: REDIRECT_URI, // Uses the dynamic REDIRECT_URI
                 scope: SCOPES,
             }),
         });
@@ -679,7 +671,7 @@ app.get('/discord/callback', async (req, res) => {
     }
 });
 
-// POST route: Handles the form submission to start the tournament (UPDATED)
+// POST route: Handles the form submission to start the tournament
 app.post('/start-tournament', async (req, res) => {
     if (tournamentState.isActive) {
         return res.status(400).send(`
@@ -695,18 +687,15 @@ app.post('/start-tournament', async (req, res) => {
         `);
     }
 
-    // Now receiving guildId and channelId separately
     const { name, prize, guildId, channelId, entryFee } = req.body;
     
-    // Simple validation
     if (!name || !prize || !guildId || !channelId) {
-        return res.status(400).send('<body style="background: black; color: white;">Missing required details (Name, Prize, Server ID, or Channel ID).</body>');
+        return res.status(400).send('<body style="background: black; color: white;">Missing required details.</body>');
     }
     
     let htmlResponse;
     try {
         const channel = await client.channels.fetch(channelId);
-        // ChannelType.GuildText = 0
         if (!channel || channel.type !== ChannelType.GuildText || channel.guildId !== guildId) { 
             throw new Error('Invalid Channel ID or Channel does not belong to the selected server.');
         }
@@ -727,7 +716,7 @@ app.post('/start-tournament', async (req, res) => {
                 { name: 'Entry Fee', value: entryFee || 'Free', inline: true },
                 { name: 'Participants', value: '0 registered', inline: false }
             )
-            .setColor(0x6366f1); // Accent color
+            .setColor(0x6366f1); 
 
         const message = await channel.send({ 
             embeds: [initialEmbed],
